@@ -2,7 +2,7 @@
 
 . tools/environment
 
-VERSION="10.0.0"
+VERSION="11.0.2"
 
 rm -rf $QEMU_DIR
 mkdir -p $QEMU_DIR

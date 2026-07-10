@@ -7,7 +7,7 @@ if [ -z $CROSS_COMPILE ]; then
 fi
 
 rm -rf $U_BOOT_DIR
-git clone --depth=1 -b v2024.04 https://source.denx.de/u-boot/u-boot.git $U_BOOT_DIR
+git clone --depth=1 -b v2024.04 https://github.com/u-boot/u-boot.git $U_BOOT_DIR
 
 pushd $U_BOOT_DIR
 make qemu_arm64_defconfig
