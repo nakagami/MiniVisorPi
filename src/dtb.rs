@@ -17,7 +17,7 @@ pub struct Dtb {
 }
 
 pub struct DtbNode {
-    /* node's name の直後の位置 */
+    /* Position right after the node's name */
     address: usize,
     address_cells: u32,
     size_cells: u32,

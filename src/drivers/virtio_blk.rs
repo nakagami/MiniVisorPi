@@ -1,5 +1,5 @@
 //!
-//! Virtio-Blkの実装
+//! Virtio-Blk implementation
 //!
 
 use crate::drivers::virtio::*;
@@ -9,7 +9,7 @@ pub const VIRTIO_BLK_TYPE_OUT: u32 = 1;
 pub const VIRTIO_BLK_S_OK: u8 = 0;
 pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 
-/// ディスクがRead Onlyかどうか
+/// Whether the disk is Read Only
 const VIRTIO_BLK_F_RO: u32 = 1 << 5;
 
 #[repr(C)]
@@ -51,9 +51,9 @@ impl VirtioBlk {
         {
             return Err(());
         }
-        /* デバイスのリセット */
+        /* Reset the device */
         Self::write_register(base_address, VIRTIO_MMIO_STATUS, 0);
-        /* デバイスを認識した事を通知 */
+        /* Notify that the device has been recognized */
         Self::write_register(
             base_address,
             VIRTIO_MMIO_STATUS,
@@ -61,19 +61,19 @@ impl VirtioBlk {
                 | VIRTIO_DEVICE_STATUS_ACKNOWLEDGE,
         );
 
-        /* デバイスの対応機能を取得 */
+        /* Get the device's supported features */
         Self::write_register(
             base_address,
             VIRTIO_MMIO_STATUS,
             Self::read_register(base_address, VIRTIO_MMIO_STATUS) | VIRTIO_DEVICE_STATUS_DRIVER,
         );
         let mut features = Self::read_register(base_address, VIRTIO_MMIO_DEVICE_FEATURES);
-        /* デバイスがReadOnlyかどうか確認 */
+        /* Check whether the device is ReadOnly */
         if (features & VIRTIO_BLK_F_RO) != 0 {
             println!("Disk is readonly.");
             return Err(());
         }
-        /* ドライバの対応状況を設定 */
+        /* Set the driver's supported features */
         features = 0;
         Self::write_register(base_address, VIRTIO_MMIO_DRIVER_FEATURES, features);
         Self::write_register(
@@ -83,7 +83,7 @@ impl VirtioBlk {
                 | VIRTIO_DEVICE_STATUS_FEATURES_OK,
         );
 
-        /* VirtQueueの設定 */
+        /* Set up the VirtQueue */
         Self::write_register(
             base_address,
             VIRTIO_MMIO_GUEST_PAGE_SIZE,
@@ -115,14 +115,14 @@ impl VirtioBlk {
             (queue >> VIRTIO_PAGE_SHIFT) as u32,
         );
 
-        /* 設定完了を通知 */
+        /* Notify that setup is complete */
         Self::write_register(
             base_address,
             VIRTIO_MMIO_STATUS,
             Self::read_register(base_address, VIRTIO_MMIO_STATUS) | VIRTIO_DEVICE_STATUS_DRIVER_OK,
         );
 
-        /* VirtQueueの各要素のアドレス計算 */
+        /* Compute the address of each VirtQueue element */
         let descriptor_table = queue;
         let available_ring = descriptor_table + size_of::<VirtQueueDesc>() * NUMBER_OF_DESCRIPTORS;
         let used_ring = ((available_ring + size_of::<VirtQueueAvail>() - 1)
@@ -179,7 +179,7 @@ impl VirtioBlk {
             return Err(());
         }
 
-        /* Virtio BLK Requestの設定 */
+        /* Set up the Virtio BLK Request */
         let virtio_blk_req = VirtioBlkReq {
             req_type: if is_write {
                 VIRTIO_BLK_TYPE_OUT
@@ -197,7 +197,7 @@ impl VirtioBlk {
         first_descriptor.length = size_of::<VirtioBlkReq>() as u32;
         first_descriptor.flags = VIRT_QUEUE_DESC_FLAGS_NEXT;
 
-        /* Bufferの設定 */
+        /* Set up the Buffer */
         let Some((second_idx, second_descriptor)) = self.allocate_descriptor() else {
             println!("Failed to allocate descriptor");
             return Err(());
@@ -211,7 +211,7 @@ impl VirtioBlk {
         }
         first_descriptor.next = second_idx;
 
-        /* Statusの設定 */
+        /* Set up the Status */
         let mut status: u8 = 0xFF;
         let Some((third_idx, third_descriptor)) = self.allocate_descriptor() else {
             println!("Failed to allocate descriptor");
@@ -222,13 +222,13 @@ impl VirtioBlk {
         third_descriptor.flags = VIRT_QUEUE_DESC_FLAGS_WRITE;
         second_descriptor.next = third_idx;
 
-        /* Available Ring の更新 */
+        /* Update the Available Ring */
         let avail_ring = unsafe { &mut *self.avail };
         let idx = avail_ring.idx as usize;
         avail_ring.ring[idx % NUMBER_OF_DESCRIPTORS] = first_idx;
         avail_ring.idx += 1;
 
-        /* デバイスに通知 */
+        /* Notify the device */
         Self::write_register(self.base_address, VIRTIO_MMIO_QUEUE_NOTIFY, 0);
 
         /* Spin Wait */

@@ -1,9 +1,9 @@
 //!
-//! 割り込み制御
+//! Interrupt control
 //!
 use crate::asm;
-use crate::drivers::{generic_timer, gicv3::*};
-use crate::mmio::gicv3;
+use crate::drivers::{generic_timer, gicv2::*};
+use crate::mmio::gicv2;
 use crate::registers::*;
 use crate::vgic;
 use crate::vm;
@@ -46,7 +46,7 @@ pub struct Registers {
     padding: u64,
 }
 
-/* 例外テーブル */
+/* Exception table */
 global_asm!(
     "
 .section .text
@@ -205,7 +205,6 @@ pub fn setup_exception() {
         static exception_table: *const u8;
     }
     unsafe { asm::set_vbar_el2(&exception_table as *const _ as usize as u64) };
-    unsafe { asm::set_icc_ctlr_el1(asm::get_icc_ctlr_el1() | ICC_CTLR1_EL1_EOI_MODE) };
 }
 
 extern "C" fn synchronous_handler(registers: *mut Registers) {
@@ -260,20 +259,20 @@ fn data_abort_handler(registers: &mut Registers, esr_el2: u64) {
 }
 
 extern "C" fn irq_handler() {
-    let (interrupt_number, group) = GicRedistributor::get_acknowledge();
+    let (interrupt_number, group) = GicCpuInterface::get_acknowledge();
     let mut deactivate = true;
     if interrupt_number == unsafe { crate::PL011_INT_ID } {
         crate::handle_input(&crate::PL011_DEVICE);
     } else if interrupt_number == vgic::MAINTENANCE_INTERRUPT_INTID {
         vgic::maintenance_interrupt_handler();
-    } else if interrupt_number == gicv3::INJECT_INTERRUPT_INT_ID {
-        gicv3::inject_interrupt_handler();
+    } else if interrupt_number == gicv2::INJECT_INTERRUPT_INT_ID {
+        gicv2::inject_interrupt_handler();
     } else if interrupt_number == unsafe { generic_timer::GENERIC_TIMER_PHYSICAL_INT_ID } {
         generic_timer::generic_timer_interrupt_handler();
-        deactivate = false; /* Deactivate はVGICが処理する */
+        deactivate = false; /* Deactivate is handled by the VGIC */
     }
-    GicRedistributor::drop_priority(interrupt_number, group);
+    GicCpuInterface::drop_priority(interrupt_number, group);
     if deactivate {
-        GicRedistributor::deactivate(interrupt_number);
+        GicCpuInterface::deactivate(interrupt_number);
     }
 }

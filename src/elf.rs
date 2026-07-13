@@ -1,5 +1,5 @@
 //!
-//! ELFヘッダに関する実装
+//! ELF header related implementation
 //!
 
 const ELF_MAGIC: [u8; 4] = [0x7f, 0x45, 0x4c, 0x46];

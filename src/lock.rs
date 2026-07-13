@@ -1,5 +1,5 @@
 //!
-//! Spin Lock による Mutex<T> の実装
+//! Mutex<T> implementation using a Spin Lock
 //!
 
 use crate::asm::{get_daif_and_disable_irq_fiq, set_daif};

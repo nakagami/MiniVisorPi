@@ -63,7 +63,7 @@ impl Console {
             if f(command_list) {
                 self.reset_buffer();
             } else {
-                /* 自動的にコンソールを無効化 */
+                /* Automatically deactivate the console */
                 crate::IS_CONSOLE_ACTIVE.fetch_xor(true, Ordering::Relaxed);
             }
         } else {
@@ -77,7 +77,7 @@ impl Console {
         print!("Command>");
     }
 
-    /* 各コマンドの実装 */
+    /* Implementation of each command */
 
     pub fn echo(list: SplitWhitespace) -> bool {
         for arg in list {
@@ -94,7 +94,7 @@ impl Console {
 
     pub fn boot_vm(_: SplitWhitespace) -> bool {
         if crate::launch_cpu() {
-            /* Active VM は自動的に切り替わる */
+            /* The Active VM switches automatically */
             println!("Booted a new VM");
             false
         } else {

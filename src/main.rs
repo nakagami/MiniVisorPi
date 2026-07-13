@@ -10,7 +10,7 @@ mod console;
 mod dtb;
 mod drivers {
     pub mod generic_timer;
-    pub mod gicv3;
+    pub mod gicv2;
     pub mod pl011;
     pub mod virtio;
     pub mod virtio_blk;
@@ -21,7 +21,7 @@ mod fat32;
 mod lock;
 mod memory_allocator;
 mod mmio {
-    pub mod gicv3;
+    pub mod gicv2;
     pub mod pl011;
     pub mod virtio_blk;
 }
@@ -31,7 +31,7 @@ mod registers;
 mod vgic;
 mod vm;
 
-use drivers::{generic_timer, gicv3, pl011, virtio_blk};
+use drivers::{generic_timer, gicv2, pl011, virtio_blk};
 use lock::Mutex;
 use psci::PsciErrorCodes;
 use serial::SerialDevice;
@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 struct GlobalAllocator {}
 
-/// グローバル変数置き場
+/// Global variable storage
 static PL011_DEVICE: Mutex<pl011::Pl011> = Mutex::new(pl011::Pl011::invalid());
 static mut PL011_INT_ID: u32 = 0;
 static MEMORY_ALLOCATOR: Mutex<memory_allocator::MemoryAllocator> =
@@ -57,7 +57,7 @@ static CONSOLE: Mutex<console::Console> = Mutex::new(console::Console::new());
 static IS_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
 
-/// 定数
+/// Constants
 const STACK_SIZE: usize = 0x10000;
 const CONSOLE_SWITCH_KEY: u8 = 0x13; /* Ctrl + S */
 
@@ -68,9 +68,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
         return 1;
     }
     let args = unsafe { slice::from_raw_parts(argv, argc) };
-    /* argv[0] は DTB */
+    /* argv[0] is the DTB */
     let Ok(arg_0) = unsafe { CStr::from_ptr(args[0]) }.to_str() else {
-        /* 変換に失敗 */
+        /* Conversion failed */
         return 2;
     };
     let Some(dtb_address) = str_to_usize(arg_0) else {
@@ -89,8 +89,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     println!("CurrentEL: {}", current_el);
     assert_eq!(current_el, 2);
 
-    /* メモリ管理のセットアップ */
-    /* argv[1] は ELFヘッダの位置 */
+    /* Set up memory management */
+    /* argv[1] is the ELF header location */
     let arg_1 = unsafe { CStr::from_ptr(args[1]) }
         .to_str()
         .expect("Failed to get argv[1]");
@@ -99,7 +99,9 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
 
     exception::setup_exception();
     let distributor = init_gic_distributor(&dtb);
-    let redistributor = init_gic_redistributor(&dtb);
+    let _gic_cpu_interface = init_gic_cpu_interface(&dtb);
+    let gic_hypervisor_interface = init_gic_hypervisor_interface(&dtb);
+    let (gicv_base_address, gicv_size) = get_gic_virtual_cpu_interface(&dtb);
 
     enable_serial_port_interrupt(&PL011_DEVICE.lock(), &distributor);
 
@@ -108,7 +110,14 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     let mut virtblk = init_virtio_blk(&dtb).unwrap();
     let fat32 = init_fat32(&mut virtblk);
 
-    let (boot_address, argument) = vm::create_vm(&fat32, &mut virtblk, &redistributor);
+    let (boot_address, argument) = vm::create_vm(
+        &fat32,
+        &mut virtblk,
+        &distributor,
+        &gic_hypervisor_interface,
+        gicv_base_address,
+        gicv_size,
+    );
 
     *VIRTIO_BLK.lock() = virtblk;
     unsafe {
@@ -116,7 +125,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
         (&raw mut DTB).as_mut().unwrap().write(dtb);
     }
 
-    /* PSCIのバージョンチェック */
+    /* Check PSCI version */
     let (major_version, minor_version) = psci::check_psci_version().expect("PSCI is not supported");
     println!("PSCI version {major_version}.{minor_version}");
 
@@ -172,10 +181,10 @@ fn init_serial_port(dtb: &dtb::Dtb) -> Result<(), usize> {
     let interrupts =
         dtb.read_property_as_u32_array(&dtb.get_property(&pl011, b"interrupts").unwrap());
     let mut interrupt_number = 0;
-    if u32::from_be(interrupts[0]) == gicv3::DTB_GIC_SPI
-        && u32::from_be(interrupts[2]) == gicv3::DTB_GIC_LEVEL
+    if u32::from_be(interrupts[0]) == gicv2::DTB_GIC_SPI
+        && u32::from_be(interrupts[2]) == gicv2::DTB_GIC_LEVEL
     {
-        interrupt_number = gicv3::GIC_SPI_BASE + u32::from_be(interrupts[1]);
+        interrupt_number = gicv2::GIC_SPI_BASE + u32::from_be(interrupts[1]);
     }
 
     let Ok(pl011) = pl011::Pl011::new(pl011_base, pl011_range) else {
@@ -208,7 +217,7 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
         .free(start, size)
         .expect("Failed to free the RAM");
 
-    /* DTBを除外 */
+    /* Exclude the DTB */
     println!(
         "DTB is [{:#X} ~ {:#X}]",
         dtb_address,
@@ -236,7 +245,7 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
         }
     }
 
-    /* Stackを除外 */
+    /* Exclude the stack */
     let stack_end = ((stack_pointer - 1) & !(paging::PAGE_SIZE - 1)) + paging::PAGE_SIZE;
     let stack_start = stack_end - STACK_SIZE;
     println!("Reserve [{:#X} ~ {:#X}] for Stack", stack_start, stack_end);
@@ -267,38 +276,61 @@ pub fn free_pages(address: usize, number_of_pages: usize) {
         .free(address, number_of_pages << paging::PAGE_SHIFT);
 }
 
-fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv3::GicDistributor {
-    let gic_node = dtb.search_node_by_compatible(b"arm,gic-v3", None).unwrap();
+const GIC_COMPATIBLE: &[u8] = b"arm,cortex-a15-gic";
+
+fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv2::GicDistributor {
+    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
     let (base_address, size) = dtb.read_reg_property(&gic_node, 0).unwrap();
     println!("GIC Distributor's Base Address: {:#X}", base_address);
-    let gic_distributor = gicv3::GicDistributor::new(base_address, size).unwrap();
+    let gic_distributor = gicv2::GicDistributor::new(base_address, size).unwrap();
     gic_distributor.init();
     gic_distributor
 }
 
-fn init_gic_redistributor(dtb: &dtb::Dtb) -> gicv3::GicRedistributor {
-    let gic_node = dtb.search_node_by_compatible(b"arm,gic-v3", None).unwrap();
+fn init_gic_cpu_interface(dtb: &dtb::Dtb) -> gicv2::GicCpuInterface {
+    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
     let (base_address, size) = dtb.read_reg_property(&gic_node, 1).unwrap();
-    println!("GIC Redistributor's Base Address: {:#X}", base_address);
-    let gic_redistributor = gicv3::get_self_redistributor(base_address, size).unwrap();
-    gic_redistributor.init();
-    gic_redistributor
+    if size < gicv2::GicCpuInterface::GICC_MMIO_SIZE {
+        panic!("Invalid GICC Size: {:#X}", size);
+    }
+    println!("GIC CPU Interface's Base Address: {:#X}", base_address);
+    let gic_cpu_interface = gicv2::GicCpuInterface::new(base_address);
+    gic_cpu_interface.init();
+    gic_cpu_interface
 }
 
-fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv3::GicDistributor) {
+fn init_gic_hypervisor_interface(dtb: &dtb::Dtb) -> gicv2::GicHypervisorInterface {
+    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    let (base_address, size) = dtb.read_reg_property(&gic_node, 2).unwrap();
+    if size < gicv2::GicHypervisorInterface::GICH_MMIO_SIZE {
+        panic!("Invalid GICH Size: {:#X}", size);
+    }
+    println!("GIC Hypervisor Interface's Base Address: {:#X}", base_address);
+    gicv2::GicHypervisorInterface::new(base_address)
+}
+
+/// Gets the physical address of the GICv2 Virtual CPU Interface (GICV).
+/// (Used to map it via Stage 2 passthrough to the address corresponding to the guest's GICC)
+fn get_gic_virtual_cpu_interface(dtb: &dtb::Dtb) -> (usize, usize) {
+    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    dtb.read_reg_property(&gic_node, 3).unwrap()
+}
+
+fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv2::GicDistributor) {
     let int_id = unsafe { PL011_INT_ID };
     if int_id == 0 {
         println!("PL011 does not support interrupt.");
         return;
     }
-    distributor.set_group(int_id, gicv3::GicGroup::NonSecureGroup1);
+    distributor.set_group(int_id, gicv2::GicGroup::NonSecureGroup1);
     distributor.set_priority(int_id, 0x00);
-    distributor.set_routing(int_id, false, asm::get_mpidr_el1());
+    distributor.set_target(int_id, distributor.get_own_target());
     distributor.set_trigger_mode(int_id, true);
     distributor.set_pending(int_id, false);
     distributor.set_enable(int_id, true);
     pl011.enable_interrupt();
 }
+
 
 fn init_virtio_blk(dtb: &dtb::Dtb) -> Option<virtio_blk::VirtioBlk> {
     let mut virtio = None;
@@ -331,14 +363,14 @@ pub fn init_fat32(blk: &mut virtio_blk::VirtioBlk) -> fat32::Fat32 {
         number_of_sectors: u32,
     }
     const PARTITION_TABLE_BASE: usize = 0x1BE;
-    /* MBRの読み込み */
+    /* Read the MBR */
     let mut mbr: [u8; 512] = [0; 512];
     blk.read(&mut mbr as *mut _ as usize, 0, 512)
         .expect("Failed to read first 512bytes");
-    /* BOOT Signatureの確認 */
+    /* Verify the BOOT signature */
     assert_eq!(u16::from_le_bytes([mbr[510], mbr[511]]), 0xAA55);
 
-    /* パーテイションテーブルの解析 */
+    /* Parse the partition table */
     let partition_table = unsafe {
         &*(&mbr[PARTITION_TABLE_BASE] as *const _ as usize as *const [PartitionTableEntry; 4])
     };
@@ -392,7 +424,7 @@ pub fn launch_cpu() -> bool {
                 stack_address as u64,
             ) {
                 Ok(_) => return true,
-                Err(PsciErrorCodes::AlreadyOn) => { /* 次のノードを探索 */ }
+                Err(PsciErrorCodes::AlreadyOn) => { /* Search for the next node */ }
                 Err(e) => {
                     println!("Failed to start CPU(Affinity: {:#X}): {:?}", affinity, e);
                 }
@@ -409,13 +441,19 @@ extern "C" fn core_main() -> ! {
     assert_eq!(current_el, 2);
 
     exception::setup_exception();
-    let redistributor =
-        init_gic_redistributor(unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() });
+    let dtb = unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() };
+    let distributor = init_gic_distributor(dtb);
+    let _gic_cpu_interface = init_gic_cpu_interface(dtb);
+    let gic_hypervisor_interface = init_gic_hypervisor_interface(dtb);
+    let (gicv_base_address, gicv_size) = get_gic_virtual_cpu_interface(dtb);
 
     let (boot_address, argument) = vm::create_vm(
         unsafe { (&raw const FAT32).as_ref().unwrap().assume_init_ref() },
         &mut VIRTIO_BLK.lock(),
-        &redistributor,
+        &distributor,
+        &gic_hypervisor_interface,
+        gicv_base_address,
+        gicv_size,
     );
     vm::boot_vm(boot_address, argument)
 }
@@ -434,10 +472,10 @@ fn handle_input(device: &Mutex<dyn SerialDevice>) {
         if c == CONSOLE_SWITCH_KEY {
             let old = IS_CONSOLE_ACTIVE.fetch_xor(true, Ordering::Relaxed);
             if old {
-                /* コンソール無効化: プロンプトを上書き */
+                /* Deactivate console: overwrite the prompt */
                 print!("\r");
             } else {
-                /* コンソール有効化: プロンプトを出力 */
+                /* Activate console: print the prompt */
                 CONSOLE.lock().reset_buffer();
             }
         } else if IS_CONSOLE_ACTIVE.load(Ordering::Relaxed) {

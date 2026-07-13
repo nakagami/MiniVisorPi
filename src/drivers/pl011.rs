@@ -1,5 +1,5 @@
 //!
-//! Arm PL011のデバイスドライバ
+//! Arm PL011 device driver
 //!
 use crate::serial;
 
@@ -17,17 +17,17 @@ const UART_FR: usize = 0x018;
 const UART_CR: usize = 0x030;
 const UART_IMSC: usize = 0x038;
 
-/// TX FIFO が一杯か示すビット
+/// Bit indicating whether the TX FIFO is full
 const UART_FR_TXFF: u16 = 1 << 5;
-/// RX FIFO が空か示すビット
+/// Bit indicating whether the RX FIFO is empty
 const UART_FR_RXFE: u16 = 1 << 4;
-/// 受信が有効か示すビット
+/// Bit indicating whether reception is enabled
 const UART_CR_RXE: u16 = 1 << 9;
-/// 送信が有効か表すビット
+/// Bit indicating whether transmission is enabled
 const UART_CR_TXE: u16 = 1 << 8;
-/// UARTが有効か示すビット
+/// Bit indicating whether the UART is enabled
 const UART_CR_UARTEN: u16 = 1;
-/// 受信割り込みが有効か示すビット
+/// Bit indicating whether the receive interrupt is enabled
 const UART_IMSC_RXIM: u16 = 1 << 4;
 
 impl Pl011 {
@@ -66,7 +66,7 @@ impl Pl011 {
     }
 }
 
-/// Serial構造体で使うために必要な実装
+/// Implementation required for use with the Serial struct
 impl serial::SerialDevice for Pl011 {
     fn putc(&self, c: u8) -> Result<(), Error> {
         while self.is_tx_fifo_full() {

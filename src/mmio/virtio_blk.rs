@@ -123,7 +123,7 @@ impl VirtioBlkMmio {
                 return;
             };
 
-            /* リクエストの解析 */
+            /* Parse the request */
             let blk_req = unsafe { &*(blk_req as *const VirtioBlkReq) };
             let is_write = blk_req.req_type == VIRTIO_BLK_TYPE_OUT;
             let mut offset = (blk_req.sector << 9) as usize;
@@ -132,7 +132,7 @@ impl VirtioBlkMmio {
                 return;
             }
 
-            /* イメージファイルの読み書き */
+            /* Read/write the image file */
             let mut descriptor = request_descriptor;
             let mut total_size = 0;
             let mut status = VIRTIO_BLK_S_OK;
@@ -230,7 +230,7 @@ impl MmioHandler for VirtioBlkMmio {
             _ if offset >= VIRTIO_CONFIG_OFFSET => {
                 let config_offset = offset - VIRTIO_CONFIG_OFFSET;
                 if (0..8).contains(&config_offset) {
-                    /* ブロックデバイスのサイズ */
+                    /* Block device size */
                     let capacity = self.file.get_file_size() >> 9;
                     value = (capacity >> (config_offset * 8)) as u64;
                 }

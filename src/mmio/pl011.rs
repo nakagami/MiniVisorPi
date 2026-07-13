@@ -1,8 +1,8 @@
 //!
-//! PL011 の MMIO Driver
+//! PL011 MMIO Driver
 //!
 
-use crate::mmio::gicv3::GicDistributorMmio;
+use crate::mmio::gicv2::GicDistributorMmio;
 use crate::vm::MmioHandler;
 
 const UART_DR: usize = 0x000;
@@ -20,13 +20,13 @@ const UART_PCELL_ID1: usize = 0xFF4;
 const UART_PCELL_ID2: usize = 0xFF8;
 const UART_PCELL_ID3: usize = 0xFFC;
 
-/// RX FIFO が空か示すビット
+/// Bit indicating whether the RX FIFO is empty
 const UART_FR_RXFE: u16 = 1 << 4;
-/// 受信割り込みが有効か示すビット
+/// Bit indicating whether the receive interrupt is enabled
 const UART_IMSC_RXIM: u16 = 1 << 4;
-/// 受信割り込みが起きた事を示すビット
+/// Bit indicating whether a receive interrupt has occurred
 const UART_RIS_RXRIS: u16 = 1 << 4;
-/// PL011の仮想割り込み番号
+/// PL011's virtual interrupt number
 const PL011_INT_ID: u32 = 33;
 
 pub struct Pl011Mmio {

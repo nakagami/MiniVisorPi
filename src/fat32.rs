@@ -1,5 +1,5 @@
 //!
-//! FAT32の実装
+//! FAT32 implementation
 //!
 
 use crate::drivers::virtio_blk::VirtioBlk;
@@ -61,7 +61,7 @@ impl Fat32 {
             return Err(());
         }
 
-        /* BPBの読み取り */
+        /* Read the BPB */
         let bytes_per_sector = unsafe { *((bpb_address + BYTES_PER_SECTOR_OFFSET) as *const u16) };
         let sectors_per_cluster =
             unsafe { *((bpb_address + SECTORS_PER_CLUSTER_OFFSET) as *const u8) };
@@ -71,7 +71,7 @@ impl Fat32 {
         let fat_sectors = unsafe { *((bpb_address + FAT_SIZE_OFFSET) as *const u32) };
         let root_cluster = unsafe { *((bpb_address + ROOT_CLUSTER_OFFSET) as *const u32) };
 
-        /* FATの読み込み */
+        /* Read the FAT */
         let fat_size = (fat_sectors as usize) * (bytes_per_sector as usize);
         let lba_aligned_fat_size = ((fat_size - 1) & (!(lba_size - 1))) + lba_size;
         let fat = allocate_pages(
@@ -89,7 +89,7 @@ impl Fat32 {
             return Err(());
         }
 
-        /* ルートディレクトリリストの読み込み */
+        /* Read the root directory list */
         let root_directory_pages =
             (((sectors_per_cluster as usize) * (bytes_per_sector as usize)) >> PAGE_SHIFT) + 1;
         let root_directory_list = allocate_pages(root_directory_pages, lba_size.ilog2() as usize)
@@ -259,7 +259,7 @@ impl Fat32 {
             if let Some(file_name) = Self::get_file_name(e, &mut buffer) {
                 let mut is_same = file_name == target_name;
                 if !is_same {
-                    /* 小文字にして再度比較 */
+                    /* Convert to lowercase and compare again */
                     file_name.make_ascii_lowercase();
                     is_same = file_name == target_name;
                 }
@@ -322,13 +322,13 @@ impl Fat32 {
             let mut data_offset_backup = data_offset;
 
             loop {
-                /* 読み飛ばすセクタ数の計算 */
+                /* Compute the number of sectors to skip */
                 if data_offset > (self.bytes_per_sector as usize) {
                     sector_offset = (data_offset / self.bytes_per_sector as usize) as u32;
                     data_offset -= (sector_offset as usize) * (self.bytes_per_sector as usize);
                     data_offset_backup = data_offset;
                 }
-                /* 読み込むサイズが1クラスタ分に満たない場合 */
+                /* When the size to read is less than one cluster */
                 if (length - read_bytes + data_offset) <= bytes_per_cluster {
                     sectors += (1
                         + ((length - read_bytes + data_offset).max(1) - 1)
@@ -336,13 +336,13 @@ impl Fat32 {
                     read_bytes += length - read_bytes;
                     break;
                 }
-                /* 1クラスタ丸々読み込む */
+                /* Read a whole cluster */
                 sectors += self.sectors_per_cluster as u32;
                 read_bytes += bytes_per_cluster - data_offset;
 
                 let next_cluster = next_cluster!(reading_cluster);
                 if next_cluster != reading_cluster + 1 {
-                    /* クラスタが連続していない */
+                    /* The clusters are not contiguous */
                     break;
                 }
                 data_offset = 0;
@@ -439,13 +439,13 @@ impl Fat32 {
                     );
                     return Err(());
                 }
-                /* 飛ばすセクタ数の計算 */
+                /* Compute the number of sectors to skip */
                 if data_offset > (self.bytes_per_sector as usize) {
                     sector_offset = (data_offset / self.bytes_per_sector as usize) as u32;
                     data_offset -= (sector_offset as usize) * (self.bytes_per_sector as usize);
                     data_offset_backup = data_offset;
                 }
-                /* 書き込むサイズが1クラスタ分に満たない場合 */
+                /* When the size to write is less than one cluster */
                 if (length - write_bytes + data_offset) <= bytes_per_cluster {
                     sectors += (1
                         + ((length - write_bytes + data_offset).max(1) - 1)
@@ -453,13 +453,13 @@ impl Fat32 {
                     write_bytes += length - write_bytes;
                     break;
                 }
-                /* 1クラスタ丸々書き込む */
+                /* Write a whole cluster */
                 sectors += self.sectors_per_cluster as u32;
                 write_bytes += bytes_per_cluster - data_offset;
 
                 let next_cluster = next_cluster!(writing_cluster);
                 if next_cluster != writing_cluster + 1 {
-                    /* クラスタが連続していない */
+                    /* The clusters are not contiguous */
                     break;
                 }
                 data_offset = 0;

@@ -1,5 +1,5 @@
 //!
-//! VirtIO 共通の実装
+//! Common VirtIO implementation
 //!
 
 pub const VIRTIO_MMIO_MAGIC: usize = 0x000;

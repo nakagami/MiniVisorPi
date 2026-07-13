@@ -1,5 +1,5 @@
 //!
-//! Stage2 Pagingの実装
+//! Stage 2 paging implementation
 //!
 
 use crate::allocate_pages;
@@ -79,6 +79,12 @@ impl Descriptor {
     fn set_memory_attribute_write_back(&mut self) {
         self.0 = (self.0 & !Self::ATTR_INDEX) | Self::ATTR_WRITE_BACK;
     }
+
+    /// Sets the Stage 2 output address attribute to Device-nGnRnE.
+    /// (Used when passing through MMIO directly to the guest)
+    fn set_memory_attribute_device(&mut self) {
+        self.0 &= !Self::ATTR_INDEX;
+    }
 }
 
 fn number_of_concatenated_page_tables(t0sz: u8, first_level: i8) -> usize {
@@ -132,6 +138,7 @@ fn _map_address_stage2(
     remaining_size: &mut usize,
     table_address: usize,
     permission: u64,
+    is_device: bool,
     level: i8,
     num_of_descriptors: usize,
 ) -> Result<(), ()> {
@@ -145,7 +152,11 @@ fn _map_address_stage2(
             descriptor.init();
             descriptor.set_output_address(*physical_address);
             descriptor.set_permission(permission);
-            descriptor.set_memory_attribute_write_back();
+            if is_device {
+                descriptor.set_memory_attribute_device();
+            } else {
+                descriptor.set_memory_attribute_write_back();
+            }
             descriptor.set_shareability(Shareability::InnerShareable);
             descriptor.validate_as_page_descriptor();
             *physical_address += PAGE_SIZE;
@@ -170,7 +181,11 @@ fn _map_address_stage2(
             descriptor.init();
             descriptor.set_output_address(*physical_address);
             descriptor.set_permission(permission);
-            descriptor.set_memory_attribute_write_back();
+            if is_device {
+                descriptor.set_memory_attribute_device();
+            } else {
+                descriptor.set_memory_attribute_write_back();
+            }
             descriptor.set_shareability(Shareability::InnerShareable);
             descriptor.validate_as_block_descriptor();
             *physical_address += block_size;
@@ -185,7 +200,7 @@ fn _map_address_stage2(
         /* Table descriptor */
         let mut next_level_table_address = descriptor.get_next_level_table_address();
         if !descriptor.is_table_descriptor() {
-            /* Translation table の作成 */
+            /* Create a translation table */
             next_level_table_address = allocate_pages(1, 12).map_err(|e| {
                 println!("Failed to allocate new translation table: {:?}", e);
             })?;
@@ -205,6 +220,7 @@ fn _map_address_stage2(
             remaining_size,
             next_level_table_address,
             permission,
+            is_device,
             level + 1,
             512,
         )?;
@@ -216,11 +232,48 @@ fn _map_address_stage2(
 }
 
 pub fn map_address_stage2(
+    physical_address: usize,
+    intermediate_physical_address: usize,
+    map_size: usize,
+    is_readable: bool,
+    is_writable: bool,
+) -> Result<(), ()> {
+    map_address_stage2_internal(
+        physical_address,
+        intermediate_physical_address,
+        map_size,
+        is_readable,
+        is_writable,
+        false,
+    )
+}
+
+/// Function for directly passthrough-mapping device memory, such as MMIO, to the guest.
+/// (Used when passing the GICv2 Virtual CPU Interface to the guest)
+pub fn map_device_stage2(
+    physical_address: usize,
+    intermediate_physical_address: usize,
+    map_size: usize,
+    is_readable: bool,
+    is_writable: bool,
+) -> Result<(), ()> {
+    map_address_stage2_internal(
+        physical_address,
+        intermediate_physical_address,
+        map_size,
+        is_readable,
+        is_writable,
+        true,
+    )
+}
+
+fn map_address_stage2_internal(
     mut physical_address: usize,
     mut intermediate_physical_address: usize,
     mut map_size: usize,
     is_readable: bool,
     is_writable: bool,
+    is_device: bool,
 ) -> Result<(), ()> {
     if (map_size & ((1usize << PAGE_SHIFT) - 1)) != 0 {
         println!("Map size is not aligned.");
@@ -245,6 +298,7 @@ pub fn map_address_stage2(
         &mut map_size,
         table_address,
         ((is_writable as u64) << 1) | (is_readable as u64),
+        is_device,
         initial_lookup_level,
         num_of_descriptors,
     )?;

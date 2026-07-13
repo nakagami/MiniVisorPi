@@ -2,50 +2,45 @@
 //! Virtual Generic Interrupt Controller
 //!
 
-use crate::asm;
-use crate::drivers::gicv3::{GicGroup, GicRedistributor};
-use crate::mmio::gicv3::INJECT_INTERRUPT_INT_ID;
+use crate::drivers::gicv2;
+use crate::drivers::gicv2::{GicDistributor, GicGroup, GicHypervisorInterface};
+use crate::mmio::gicv2::INJECT_INTERRUPT_INT_ID;
 use crate::vm;
 
 pub const MAINTENANCE_INTERRUPT_INTID: u32 = 25;
 
-const ICH_HCR_EL2_EN: u64 = 1 << 0;
+/* Fields (32-bit) of the GICv2 GICH_LR (List Register) */
+const GICH_LR_VIRTUAL_ID: u32 = (1 << 10) - 1;
+const GICH_LR_PHYSICAL_ID_OFFSET: u32 = 10;
+const GICH_LR_PHYSICAL_ID: u32 = ((1 << 10) - 1) << GICH_LR_PHYSICAL_ID_OFFSET;
+const GICH_LR_EOI_OFFSET: u32 = 19;
+const GICH_LR_EOI: u32 = 1 << GICH_LR_EOI_OFFSET;
+const GICH_LR_PRIORITY_OFFSET: u32 = 23;
+const GICH_LR_STATE_OFFSET: u32 = 28;
+const GICH_LR_STATE: u32 = 0b11 << GICH_LR_STATE_OFFSET;
+const GICH_LR_STATE_INACTIVE: u32 = 0b00 << GICH_LR_STATE_OFFSET;
+const GICH_LR_STATE_PENDING: u32 = 0b01 << GICH_LR_STATE_OFFSET;
+const GICH_LR_GROUP1_OFFSET: u32 = 30;
+const GICH_LR_HW_OFFSET: u32 = 31;
+const GICH_LR_HW: u32 = 1 << GICH_LR_HW_OFFSET;
 
-const ICH_VTR_EL2_LIST_REGS: u64 = 0b11111;
+/* Maximum number of List Registers used by this hypervisor */
+const NUMBER_OF_SUPPORTED_LRS: usize = 4;
 
-const ICH_LRN_EL2_STATUS: u64 = 0b11 << 62;
-const ICH_LRN_EL2_STATUS_INACTIVE: u64 = 0b00 << 62;
-const ICH_LRN_EL2_STATUS_PENDING: u64 = 0b01 << 62;
-const ICH_LRN_EL2_HW: u64 = 1 << 61;
-const ICH_LRN_EL2_EOI: u64 = 1 << 41;
-const ICH_LRN_EL2_VINTID: u64 = (1 << 32) - 1;
-
-const GET_ICH_LRN_EL2: [fn() -> u64; 3] = [
-    asm::get_ich_lr0_el2,
-    asm::get_ich_lr1_el2,
-    asm::get_ich_lr2_el2,
-];
-const SET_ICH_LRN_EL2: [unsafe fn(u64); 3] = [
-    asm::set_ich_lr0_el2,
-    asm::set_ich_lr1_el2,
-    asm::set_ich_lr2_el2,
-];
-
-pub fn init_vgic(redistributor: &GicRedistributor) {
-    let ich_hcr_el2 = ICH_HCR_EL2_EN;
-    unsafe { asm::set_ich_hcr_el2(ich_hcr_el2) };
+pub fn init_vgic(gich: &GicHypervisorInterface, distributor: &GicDistributor) {
+    gich.init();
 
     /* Enable Maintenance Interrupt */
-    redistributor.set_group(MAINTENANCE_INTERRUPT_INTID, GicGroup::NonSecureGroup1);
-    redistributor.set_priority(MAINTENANCE_INTERRUPT_INTID, 0x00);
-    redistributor.set_trigger_mode(MAINTENANCE_INTERRUPT_INTID, true);
-    redistributor.set_enable(MAINTENANCE_INTERRUPT_INTID, true);
+    distributor.set_group(MAINTENANCE_INTERRUPT_INTID, GicGroup::NonSecureGroup1);
+    distributor.set_priority(MAINTENANCE_INTERRUPT_INTID, 0x00);
+    distributor.set_trigger_mode(MAINTENANCE_INTERRUPT_INTID, true);
+    distributor.set_enable(MAINTENANCE_INTERRUPT_INTID, true);
 
     /* Enable INJECT_INTERRUPT_INT_ID */
-    redistributor.set_group(INJECT_INTERRUPT_INT_ID, GicGroup::NonSecureGroup1);
-    redistributor.set_priority(INJECT_INTERRUPT_INT_ID, 0x00);
-    redistributor.set_trigger_mode(INJECT_INTERRUPT_INT_ID, false);
-    redistributor.set_enable(INJECT_INTERRUPT_INT_ID, true);
+    distributor.set_group(INJECT_INTERRUPT_INT_ID, GicGroup::NonSecureGroup1);
+    distributor.set_priority(INJECT_INTERRUPT_INT_ID, 0x00);
+    distributor.set_trigger_mode(INJECT_INTERRUPT_INT_ID, false);
+    distributor.set_enable(INJECT_INTERRUPT_INT_ID, true);
 }
 
 pub fn create_list_register_entry(
@@ -53,58 +48,50 @@ pub fn create_list_register_entry(
     group: u32,
     priority: u32,
     physical_int_id: Option<u32>,
-) -> u64 {
-    let mut entry = ICH_LRN_EL2_STATUS_PENDING
-        | ((group as u64) << 60)
-        | ((priority as u64) << 48)
-        | (int_id as u64);
+) -> u32 {
+    let mut entry = GICH_LR_STATE_PENDING
+        | (group << GICH_LR_GROUP1_OFFSET)
+        | (((priority >> 3) & 0x1F) << GICH_LR_PRIORITY_OFFSET)
+        | (int_id & GICH_LR_VIRTUAL_ID);
     if let Some(p_int_id) = physical_int_id {
-        entry |= ICH_LRN_EL2_HW | ((p_int_id as u64) << 32);
+        entry |= GICH_LR_HW | ((p_int_id << GICH_LR_PHYSICAL_ID_OFFSET) & GICH_LR_PHYSICAL_ID);
     } else {
-        entry |= ICH_LRN_EL2_EOI;
+        entry |= GICH_LR_EOI;
     }
     entry
 }
 
-pub fn add_virtual_interrupt(entry: u64) {
-    let number_of_lrn = (asm::get_ich_vtr_el2() & ICH_VTR_EL2_LIST_REGS) as usize + 1;
-    let supported_lrn = number_of_lrn.min(GET_ICH_LRN_EL2.len());
+pub fn add_virtual_interrupt(entry: u32) {
+    let number_of_lrn = gicv2::get_gich_vtr_list_regs();
+    let supported_lrn = number_of_lrn.min(NUMBER_OF_SUPPORTED_LRS);
 
     for i in 0..supported_lrn {
-        let ich_lrn_el2 = (GET_ICH_LRN_EL2[i])();
-        if (ich_lrn_el2 & ICH_LRN_EL2_STATUS) == ICH_LRN_EL2_STATUS_INACTIVE {
-            unsafe { (SET_ICH_LRN_EL2[i])(entry) };
+        let gich_lrn = gicv2::get_gich_lr(i);
+        if (gich_lrn & GICH_LR_STATE) == GICH_LR_STATE_INACTIVE {
+            gicv2::set_gich_lr(i, entry);
             return;
-        } else if ich_lrn_el2 & ((1 << 32) - 1) == entry & ((1 << 32) - 1) {
-            unsafe { (SET_ICH_LRN_EL2[i])(ich_lrn_el2 | ICH_LRN_EL2_STATUS_PENDING) };
+        } else if (gich_lrn & GICH_LR_VIRTUAL_ID) == (entry & GICH_LR_VIRTUAL_ID) {
+            gicv2::set_gich_lr(i, gich_lrn | GICH_LR_STATE_PENDING);
             return;
         }
     }
-    println!("ICH_LRN_EL2 is overflowed.");
+    println!("GICH_LR is overflowed.");
 }
 
 pub fn maintenance_interrupt_handler() {
-    let number_of_lrn = (asm::get_ich_vtr_el2() & ICH_VTR_EL2_LIST_REGS) as usize + 1;
-    let supported_lrn = number_of_lrn.min(GET_ICH_LRN_EL2.len());
-    let mut eoi_bits = asm::get_ich_eisr_el2();
+    let number_of_lrn = gicv2::get_gich_vtr_list_regs();
+    let supported_lrn = number_of_lrn.min(NUMBER_OF_SUPPORTED_LRS);
+    let mut eoi_bits = gicv2::get_gich_eisr();
 
     for i in 0..supported_lrn {
         if (eoi_bits & 1) != 0 {
-            let entry = (GET_ICH_LRN_EL2[i])();
-            let int_id = (entry & ICH_LRN_EL2_VINTID) as u32;
+            let entry = gicv2::get_gich_lr(i);
+            let int_id = entry & GICH_LR_VIRTUAL_ID;
             let vm = vm::get_current_vm();
-            if int_id >= 32 {
-                /* SPI */
-                let mut distributor = vm.get_gic_distributor_mmio().lock();
-                distributor.change_pending_status(int_id, false);
-                distributor.change_active_status(int_id, false);
-            } else {
-                /* SGI / PPI */
-                let mut redistributor = vm.get_gic_redistributor_mmio().lock();
-                redistributor.change_pending_status(int_id, false);
-                redistributor.change_active_status(int_id, false);
-            }
-            unsafe { (SET_ICH_LRN_EL2[i])(0) };
+            let mut distributor = vm.get_gic_distributor_mmio().lock();
+            distributor.change_pending_status(int_id, false);
+            distributor.change_active_status(int_id, false);
+            gicv2::set_gich_lr(i, 0);
         }
         eoi_bits >>= 1;
     }

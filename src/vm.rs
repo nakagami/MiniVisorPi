@@ -1,16 +1,16 @@
 //!
-//! Virtual Machine の管理モジュール
+//! Virtual Machine management module
 //!
 
 use crate::asm;
-use crate::drivers::{generic_timer, gicv3::GicRedistributor, virtio_blk::VirtioBlk};
+use crate::drivers::{
+    generic_timer,
+    gicv2::{GicDistributor, GicHypervisorInterface},
+    virtio_blk::VirtioBlk,
+};
 use crate::fat32::Fat32;
 use crate::lock::Mutex;
-use crate::mmio::{
-    gicv3::{GicDistributorMmio, GicRedistributorMmio},
-    pl011::Pl011Mmio,
-    virtio_blk::VirtioBlkMmio,
-};
+use crate::mmio::{gicv2::GicDistributorMmio, pl011::Pl011Mmio, virtio_blk::VirtioBlkMmio};
 use crate::paging::*;
 use crate::registers::*;
 use crate::vgic;
@@ -39,7 +39,6 @@ pub struct VM {
     ram_size: usize,
     mmio_handlers: LinkedList<MmioEntry>,
     gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
-    gic_redistributor_mmio: Arc<Mutex<GicRedistributorMmio>>,
     pl011_mmio: Arc<Mutex<Pl011Mmio>>,
 }
 
@@ -70,7 +69,6 @@ impl VM {
         ram_size: usize,
         mmio_handlers: LinkedList<MmioEntry>,
         gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
-        gic_redistributor_mmio: Arc<Mutex<GicRedistributorMmio>>,
         pl011_mmio: Arc<Mutex<Pl011Mmio>>,
     ) -> Self {
         Self {
@@ -80,7 +78,6 @@ impl VM {
             ram_size,
             mmio_handlers,
             gic_distributor_mmio,
-            gic_redistributor_mmio,
             pl011_mmio,
         }
     }
@@ -128,10 +125,6 @@ impl VM {
         &self.gic_distributor_mmio
     }
 
-    pub fn get_gic_redistributor_mmio(&self) -> &Mutex<GicRedistributorMmio> {
-        &self.gic_redistributor_mmio
-    }
-
     pub fn get_pl011_mmio(&self) -> &Mutex<Pl011Mmio> {
         &self.pl011_mmio
     }
@@ -154,35 +147,52 @@ impl MmioEntry {
 pub fn create_vm(
     fat32: &Fat32,
     blk: &mut VirtioBlk,
-    gic_redistributor: &GicRedistributor,
+    gic_distributor: &GicDistributor,
+    gic_hypervisor_interface: &GicHypervisorInterface,
+    gic_virtual_cpu_interface_physical_address: usize,
+    gic_virtual_cpu_interface_size: usize,
 ) -> (usize, usize) {
     const RAM_VIRTUAL_BASE: usize = 0x40000000;
     /// RAM SIZE: 256MiB
     const RAM_SIZE: usize = 0x10000000;
     const ALIGN_SIZE: usize = 0x200000;
+    /* Address of the GICv2 CPU Interface (GICC) shown to the guest
+     * (must match reg[1] of the intc node in scripts/virt.dts) */
+    const GUEST_GIC_CPU_INTERFACE_ADDRESS: usize = 0x8010000;
 
-    /* 仮想マシンの基本要素の設定 */
+    /* Set up the basic elements of the virtual machine */
     let ram_physical_address = crate::allocate_pages(RAM_SIZE >> PAGE_SHIFT, PAGE_SHIFT)
         .expect("Failed to allocate memory for VM.");
     let vm_id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);
     let cpu_mpidr = asm::get_mpidr_el1();
 
-    /* 仮想化に関するハードウェアの設定 */
-    /* レジスタのセットアップ */
+    /* Configure hardware related to virtualization */
+    /* Set up registers */
     setup_hypervisor_registers();
 
-    /* Stage 2 Translation の初期化 */
+    /* Initialize the Stage 2 translation table */
     init_stage2_translation_table();
     map_address_stage2(ram_physical_address, RAM_VIRTUAL_BASE, RAM_SIZE, true, true)
         .expect("Failed to map memory");
 
-    /* Virtual GICの初期化 */
-    vgic::init_vgic(gic_redistributor);
+    /* Directly passthrough-map the GICv2 Virtual CPU Interface (GICV) to the guest's GICC address.
+     * (The guest accesses the hardware virtual CPU interface directly, so EOI/ACK do not trap) */
+    map_device_stage2(
+        gic_virtual_cpu_interface_physical_address,
+        GUEST_GIC_CPU_INTERFACE_ADDRESS,
+        gic_virtual_cpu_interface_size,
+        true,
+        true,
+    )
+    .expect("Failed to map GICv2 Virtual CPU Interface");
 
-    /* Generic Timerの初期化 */
-    generic_timer::init_generic_timer_local(gic_redistributor);
+    /* Initialize the virtual GIC */
+    vgic::init_vgic(gic_hypervisor_interface, gic_distributor);
 
-    /* MMIO ハンドラの初期化 */
+    /* Initialize the Generic Timer */
+    generic_timer::init_generic_timer_local(gic_distributor);
+
+    /* Initialize the MMIO handlers */
     let mut mmio_handlers = LinkedList::new();
 
     /* PL011 */
@@ -200,23 +210,17 @@ pub fn create_vm(
         Arc::new(Mutex::new(VirtioBlkMmio::new(disk_file))),
     ));
 
-    /* GIC Distributor */
-    let gic_distributor_mmio = Arc::new(Mutex::new(GicDistributorMmio::new()));
+    /* GIC Distributor(Virtual) */
+    let gic_distributor_mmio = Arc::new(Mutex::new(GicDistributorMmio::new(
+        gic_distributor.get_own_target(),
+    )));
     mmio_handlers.push_back(MmioEntry::new(
         0x8000000,
         GicDistributorMmio::MMIO_SIZE,
         gic_distributor_mmio.clone(),
     ));
 
-    /* GIC Redistributor */
-    let gic_redistributor_mmio = Arc::new(Mutex::new(GicRedistributorMmio::new(cpu_mpidr)));
-    mmio_handlers.push_back(MmioEntry::new(
-        0x80a0000,
-        GicRedistributorMmio::MMIO_SIZE,
-        gic_redistributor_mmio.clone(),
-    ));
-
-    /* VM構造体の作成 */
+    /* Create the VM structure */
     let vm = VM::new(
         vm_id,
         RAM_VIRTUAL_BASE,
@@ -224,11 +228,10 @@ pub fn create_vm(
         RAM_SIZE,
         mmio_handlers,
         gic_distributor_mmio,
-        gic_redistributor_mmio,
         pl011_mmio,
     );
 
-    /* Linux KernelとDevicetreeの読み込み */
+    /* Load the Linux kernel and devicetree */
     let kernel = fat32.search_file("IMAGE").unwrap();
     let dtb = fat32.search_file("DTB").unwrap();
     let dtb_size = dtb.get_file_size();
@@ -244,7 +247,7 @@ pub fn create_vm(
         .read(&kernel, blk, kernel_physical_address, 0, kernel_size)
         .expect("Failed to read Kernel");
 
-    /* Linux Kernel Headerの解析 */
+    /* Parse the Linux kernel header */
     let header = unsafe { &*(kernel_physical_address as *const KernelHeader) };
     if header.magic != 0x644D5241 {
         panic!("Invalid Kernel Magic: {:#X}", header.magic);
@@ -255,7 +258,7 @@ pub fn create_vm(
         text_offset = 0x80000;
     }
 
-    /* VM構造体のリストへの追加 */
+    /* Add to the VM structure list */
     VM_LIST.lock().push_back(Arc::new(vm));
     switch_active_vm(vm_id);
 
@@ -270,7 +273,7 @@ pub fn create_vm(
 
 pub fn boot_vm(entry_point: usize, argument: usize) -> ! {
     unsafe {
-        /* 仮想マシンの起動 */
+        /* Boot the virtual machine */
         asm::set_spsr_el2(SPSR_EL2_M_EL1H);
         asm::set_elr_el2(entry_point as u64);
         asm::eret(argument as u64, 0, 0, 0);

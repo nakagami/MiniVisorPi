@@ -1,5 +1,5 @@
 //!
-//! レジスタの定数値を列挙するためのモジュール
+//! Module for enumerating register constant values
 //!
 
 /* HCR_EL2 */
@@ -46,6 +46,3 @@ pub const ESR_EL2_ISS_WNR: u64 = 1 << 6;
 /* HPFAR_EL2 */
 pub const HPFAR_EL2_FIPA_BITS_OFFSET: u64 = 4;
 pub const HPFAR_EL2_FIPA: u64 = ((1 << 44) - 1) & !((1 << 4) - 1);
-
-/* ICC_CTLR1_EL1 */
-pub const ICC_CTLR1_EL1_EOI_MODE: u64 = 1 << 1;

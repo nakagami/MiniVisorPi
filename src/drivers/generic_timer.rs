@@ -3,7 +3,7 @@
 //!
 
 use crate::asm;
-use crate::drivers::gicv3;
+use crate::drivers::gicv2;
 use crate::dtb;
 use crate::vm;
 
@@ -18,28 +18,28 @@ pub fn init_generic_timer_global(dtb: &dtb::Dtb) {
         &dtb.get_property(&generic_timer_node, b"interrupts")
             .unwrap(),
     );
-    if u32::from_be(interrupt_number[6]) == gicv3::DTB_GIC_PPI {
+    if u32::from_be(interrupt_number[6]) == gicv2::DTB_GIC_PPI {
         unsafe {
-            GENERIC_TIMER_PHYSICAL_INT_ID = gicv3::GIC_PPI_BASE + u32::from_be(interrupt_number[7])
+            GENERIC_TIMER_PHYSICAL_INT_ID = gicv2::GIC_PPI_BASE + u32::from_be(interrupt_number[7])
         };
     }
 }
 
-pub fn init_generic_timer_local(redistributor: &gicv3::GicRedistributor) {
-    /* オフセットを0で初期化 */
+pub fn init_generic_timer_local(distributor: &gicv2::GicDistributor) {
+    /* Initialize the offset to 0 */
     unsafe { asm::set_cntvoff_el2(0) };
 
-    /* Generic Timer の割り込みを有効化 */
+    /* Enable the Generic Timer interrupt */
     let int_id = unsafe { GENERIC_TIMER_PHYSICAL_INT_ID };
-    redistributor.set_group(int_id, gicv3::GicGroup::NonSecureGroup1);
-    redistributor.set_priority(int_id, 0x00);
-    redistributor.set_trigger_mode(int_id, true);
-    redistributor.set_enable(int_id, true);
+    distributor.set_group(int_id, gicv2::GicGroup::NonSecureGroup1);
+    distributor.set_priority(int_id, 0x00);
+    distributor.set_trigger_mode(int_id, true);
+    distributor.set_enable(int_id, true);
 }
 
 pub fn generic_timer_interrupt_handler() {
     vm::get_current_vm()
-        .get_gic_redistributor_mmio()
+        .get_gic_distributor_mmio()
         .lock()
         .trigger_interrupt(
             GENERIC_TIMER_VIRTUAL_INT_ID,

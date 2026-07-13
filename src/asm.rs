@@ -1,5 +1,5 @@
 //!
-//! アセンブリを記述したモジュール
+//! Assembly module
 //!
 
 use core::arch::{asm, naked_asm};
@@ -118,43 +118,6 @@ pub const fn mpidr_to_affinity(mpidr: u64) -> u64 {
     mpidr & !((1 << 31) | (1 << 30))
 }
 
-pub fn get_packed_affinity() -> u32 {
-    let mpidr = mpidr_to_affinity(get_mpidr_el1());
-    ((mpidr & ((1 << 24) - 1)) | ((mpidr & (0xff << 32)) >> (32 - 24))) as u32
-}
-
-pub fn get_icc_sre_el2() -> u64 {
-    let icc_sre_el2: u64;
-    unsafe { asm!("mrs {}, icc_sre_el2", out(reg) icc_sre_el2) };
-    icc_sre_el2
-}
-
-pub unsafe fn set_icc_sre_el2(icc_sre_el2: u64) {
-    unsafe { asm!("msr icc_sre_el2, {}", in(reg) icc_sre_el2) };
-}
-
-pub unsafe fn set_icc_igrpen1_el1(icc_igrpen1_el1: u64) {
-    unsafe { asm!("msr icc_igrpen1_el1, {}", in(reg) icc_igrpen1_el1) };
-}
-
-pub unsafe fn set_icc_pmr_el1(icc_pmr_el1: u64) {
-    unsafe { asm!("msr icc_pmr_el1, {}", in(reg) icc_pmr_el1) };
-}
-
-pub unsafe fn set_icc_bpr1_el1(icc_bpr1_el1: u64) {
-    unsafe { asm!("msr icc_bpr1_el1, {}", in(reg) icc_bpr1_el1) };
-}
-
-pub unsafe fn set_icc_eoir1_el1(icc_eoir1_el1: u64) {
-    unsafe { asm!("msr icc_eoir1_el1, {}", in(reg) icc_eoir1_el1) };
-}
-
-pub fn get_icc_iar1_el1() -> u64 {
-    let icc_iar1_el1: u64;
-    unsafe { asm!("mrs {}, icc_iar1_el1", out(reg) icc_iar1_el1) };
-    icc_iar1_el1
-}
-
 pub unsafe fn invalidate_cache(address: usize) {
     unsafe { asm!("dc ivac, {}", in(reg) address) };
 }
@@ -171,70 +134,6 @@ pub unsafe fn set_vmpidr_el2(vmpidr_el2: u64) {
 
 pub unsafe fn set_vpidr_el2(vpidr_el2: u64) {
     unsafe { asm!("msr vpidr_el2, {}", in(reg) vpidr_el2) };
-}
-
-pub unsafe fn set_icc_sgi1r_el1(icc_sgi1r_el1: u64) {
-    unsafe { asm!("msr icc_sgi1r_el1, {}", in(reg) icc_sgi1r_el1) };
-}
-
-pub fn get_ich_eisr_el2() -> u64 {
-    let ich_eisr_el2: u64;
-    unsafe { asm!("mrs {}, ich_eisr_el2", out(reg) ich_eisr_el2) };
-    ich_eisr_el2
-}
-
-pub fn get_ich_vtr_el2() -> u64 {
-    let ich_vtr_el2: u64;
-    unsafe { asm!("mrs {}, ich_vtr_el2", out(reg) ich_vtr_el2) };
-    ich_vtr_el2
-}
-
-pub unsafe fn set_ich_hcr_el2(ich_hcr_el2: u64) {
-    unsafe { asm!("msr ich_hcr_el2, {}", in(reg) ich_hcr_el2) };
-}
-
-pub fn get_ich_lr0_el2() -> u64 {
-    let ich_lr0_el2: u64;
-    unsafe { asm!("mrs {}, ich_lr0_el2", out(reg) ich_lr0_el2) };
-    ich_lr0_el2
-}
-
-pub unsafe fn set_ich_lr0_el2(ich_lr0_el2: u64) {
-    unsafe { asm!("msr ich_lr0_el2, {}", in(reg) ich_lr0_el2) };
-}
-
-pub fn get_ich_lr1_el2() -> u64 {
-    let ich_lr1_el2: u64;
-    unsafe { asm!("mrs {}, ich_lr1_el2", out(reg) ich_lr1_el2) };
-    ich_lr1_el2
-}
-
-pub unsafe fn set_ich_lr1_el2(ich_lr1_el2: u64) {
-    unsafe { asm!("msr ich_lr1_el2, {}", in(reg) ich_lr1_el2) };
-}
-
-pub fn get_ich_lr2_el2() -> u64 {
-    let ich_lr2_el2: u64;
-    unsafe { asm!("mrs {}, ich_lr2_el2", out(reg) ich_lr2_el2) };
-    ich_lr2_el2
-}
-
-pub unsafe fn set_ich_lr2_el2(ich_lr2_el2: u64) {
-    unsafe { asm!("msr ich_lr2_el2, {}", in(reg) ich_lr2_el2) };
-}
-
-pub unsafe fn set_icc_dir_el1(icc_dir_el1: u64) {
-    unsafe { asm!("msr icc_dir_el1, {}", in(reg) icc_dir_el1) };
-}
-
-pub fn get_icc_ctlr_el1() -> u64 {
-    let icc_ctlr_el1: u64;
-    unsafe { asm!("mrs {}, icc_ctlr_el1", out(reg) icc_ctlr_el1) };
-    icc_ctlr_el1
-}
-
-pub unsafe fn set_icc_ctlr_el1(icc_ctlr_el1: u64) {
-    unsafe { asm!("msr icc_ctlr_el1, {}", in(reg) icc_ctlr_el1) };
 }
 
 pub unsafe fn set_cntvoff_el2(cntvoff_el2: u64) {
