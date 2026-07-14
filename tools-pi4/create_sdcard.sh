@@ -2,7 +2,10 @@
 
 . tools-pi4/environment
 
-cp $1 $DISK_IMG_DIR$BINARY_NAME
+if [ ! -f $DISK_IMG_DIR$BINARY_NAME ]; then
+    echo "$DISK_IMG_DIR$BINARY_NAME not found. Run 'cargo build-pi4' first." >&2
+    exit 1
+fi
 
 # u-boot.bin is loaded as the "kernel" by the Raspberry Pi GPU firmware
 # (see config.txt's kernel= entry below), and bcm2711-rpi-4-b.dtb is loaded
