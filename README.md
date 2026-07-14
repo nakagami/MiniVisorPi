@@ -28,7 +28,10 @@ AArch64向けの小型Type1ハイパーバイザ
    ```
    tools-pi4/build_buildroot.sh
    ```
-3. MiniVisor本体(`mini.elf`)をビルドします(通常の`cargo build`等の手順に従ってください)。
+3. MiniVisor本体(`mini.elf`)をビルドします。`cargo build-pi4`を実行すると、ビルド後に`bin-pi4/disk/mini.elf`へ自動でコピーされます。
+   ```
+   cargo build-pi4
+   ```
 4. SDカードイメージ`bin-pi4/disk.img`を作成します。引数には3.で生成した`mini.elf`のパスを指定します。
    ```
    tools-pi4/create_sdcard.sh <mini.elfのパス>
