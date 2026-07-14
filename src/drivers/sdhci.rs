@@ -1,0 +1,588 @@
+//!
+//! SD Host Controller Interface (SDHCI) driver
+//!
+//! Implements the standard "SD Host Controller Simplified Specification"
+//! register interface using PIO (no SDMA/ADMA), which is used by Raspberry
+//! Pi 4 (BCM2711)'s EMMC2 controller (DTB `compatible = "brcm,bcm2711-emmc2"`)
+//! to drive the microSD card slot. This is a from-scratch bring-up driver
+//! that has **not** been validated on physical hardware yet: register
+//! offsets/semantics follow the SDHCI v3.00 specification and match what
+//! Linux's `sdhci-iproc` / U-Boot's `sdhci` drivers do for this controller,
+//! but real-hardware testing is still required before relying on it.
+//!
+//! The public `read`/`write` methods intentionally mirror
+//! [`crate::drivers::virtio_blk::VirtioBlk`]'s signature so that both
+//! drivers can implement the shared [`crate::drivers::block_device::BlockDevice`]
+//! trait and be used interchangeably by the FAT32 layer.
+
+use core::ptr::{read_volatile, write_volatile};
+
+/* Register offsets (SDHCI v3.00) */
+const SDHCI_BLOCK_SIZE: usize = 0x04;
+const SDHCI_BLOCK_COUNT: usize = 0x06;
+const SDHCI_ARGUMENT: usize = 0x08;
+const SDHCI_TRANSFER_MODE: usize = 0x0C;
+const SDHCI_COMMAND: usize = 0x0E;
+const SDHCI_RESPONSE: usize = 0x10;
+const SDHCI_BUFFER: usize = 0x20;
+const SDHCI_PRESENT_STATE: usize = 0x24;
+const SDHCI_POWER_CONTROL: usize = 0x29;
+const SDHCI_CLOCK_CONTROL: usize = 0x2C;
+const SDHCI_TIMEOUT_CONTROL: usize = 0x2E;
+const SDHCI_SOFTWARE_RESET: usize = 0x2F;
+const SDHCI_INT_STATUS: usize = 0x30;
+const SDHCI_INT_ENABLE: usize = 0x34;
+const SDHCI_SIGNAL_ENABLE: usize = 0x38;
+const SDHCI_HOST_CONTROL2: usize = 0x3E;
+const SDHCI_CAPABILITIES: usize = 0x40;
+
+/* Present State register bits */
+const SDHCI_CMD_INHIBIT: u32 = 1 << 0;
+const SDHCI_DAT_INHIBIT: u32 = 1 << 1;
+const SDHCI_BUFFER_WRITE_ENABLE: u32 = 1 << 10;
+const SDHCI_BUFFER_READ_ENABLE: u32 = 1 << 11;
+const SDHCI_CARD_INSERTED: u32 = 1 << 16;
+
+/* Normal Interrupt Status bits */
+const SDHCI_INT_RESPONSE: u16 = 1 << 0;
+const SDHCI_INT_DATA_END: u16 = 1 << 1;
+const SDHCI_INT_BUFFER_WRITE_READY: u16 = 1 << 4;
+const SDHCI_INT_BUFFER_READ_READY: u16 = 1 << 5;
+const SDHCI_INT_ERROR: u16 = 1 << 15;
+
+/* Software Reset register bits */
+const SDHCI_RESET_ALL: u8 = 1 << 0;
+const SDHCI_RESET_CMD: u8 = 1 << 1;
+const SDHCI_RESET_DATA: u8 = 1 << 2;
+
+/* Clock Control register bits */
+const SDHCI_CLOCK_INT_EN: u16 = 1 << 0;
+const SDHCI_CLOCK_INT_STABLE: u16 = 1 << 1;
+const SDHCI_CLOCK_CARD_EN: u16 = 1 << 2;
+
+/* Transfer Mode register bits */
+const SDHCI_TRNS_BLK_CNT_EN: u16 = 1 << 1;
+const SDHCI_TRNS_ACMD12: u16 = 1 << 2;
+const SDHCI_TRNS_READ: u16 = 1 << 4;
+const SDHCI_TRNS_MULTI: u16 = 1 << 5;
+
+/* Command register response-type select field (bits [1:0]) */
+const SDHCI_CMD_RESP_NONE: u16 = 0b00;
+const SDHCI_CMD_RESP_136: u16 = 0b01;
+const SDHCI_CMD_RESP_48: u16 = 0b10;
+const SDHCI_CMD_RESP_48_BUSY: u16 = 0b11;
+const SDHCI_CMD_CRC_CHECK: u16 = 1 << 3;
+const SDHCI_CMD_INDEX_CHECK: u16 = 1 << 4;
+const SDHCI_CMD_DATA_PRESENT: u16 = 1 << 5;
+
+/// SD block size used for every transfer.
+const BLOCK_SIZE: usize = 512;
+/// Upper bound on polling loop iterations, so a wrong/absent controller
+/// results in a clean error instead of a permanent hang.
+const POLL_TIMEOUT: usize = 2_000_000;
+/// Number of ACMD41 (SD_SEND_OP_COND) retries while waiting for the card to
+/// leave the busy state after power-up.
+const ACMD41_RETRIES: usize = 20_000;
+
+const CMD_GO_IDLE_STATE: u8 = 0;
+const CMD_ALL_SEND_CID: u8 = 2;
+const CMD_SEND_RELATIVE_ADDR: u8 = 3;
+const CMD_SELECT_CARD: u8 = 7;
+const CMD_SEND_IF_COND: u8 = 8;
+const CMD_STOP_TRANSMISSION: u8 = 12;
+const CMD_SET_BLOCKLEN: u8 = 16;
+const CMD_READ_SINGLE_BLOCK: u8 = 17;
+const CMD_READ_MULTIPLE_BLOCK: u8 = 18;
+const CMD_WRITE_BLOCK: u8 = 24;
+const CMD_WRITE_MULTIPLE_BLOCK: u8 = 25;
+const CMD_APP_CMD: u8 = 55;
+const ACMD_SET_BUS_WIDTH: u8 = 6;
+const ACMD_SD_SEND_OP_COND: u8 = 41;
+
+/// `SEND_IF_COND` check pattern + 2.7-3.6V voltage supply flag.
+const CMD8_VOLTAGE_CHECK_PATTERN: u32 = 0x1AA;
+/// Voltage window advertised in ACMD41 (2.7-3.6V).
+const ACMD41_VOLTAGE_WINDOW: u32 = 0x00FF_8000;
+/// Host Capacity Support: request SDHC/SDXC addressing if the card supports it.
+const ACMD41_HCS: u32 = 1 << 30;
+/// Card Capacity Status returned in the ACMD41 response for SDHC/SDXC cards.
+const OCR_CCS: u32 = 1 << 30;
+/// Busy bit in the ACMD41/OCR response (0 while the card is powering up).
+const OCR_BUSY: u32 = 1 << 31;
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum ResponseType {
+    None,
+    R48,
+    R48Busy,
+    R136,
+}
+
+pub struct Sdhci {
+    base_address: usize,
+    /// Relative Card Address, obtained via CMD3 and required by most
+    /// subsequent commands (CMD7/CMD13/...).
+    rca: u32,
+    /// Whether the card understands block (SDHC/SDXC, `block_address` is a
+    /// block index) or byte (SDSC, `block_address` is a byte offset that
+    /// must be converted to a block index) addressing.
+    is_high_capacity: bool,
+}
+
+impl Sdhci {
+    pub const fn invalid() -> Self {
+        Self {
+            base_address: 0,
+            rca: 0,
+            is_high_capacity: false,
+        }
+    }
+
+    pub fn new(base_address: usize) -> Result<Self, ()> {
+        let mut sdhci = Self {
+            base_address,
+            rca: 0,
+            is_high_capacity: false,
+        };
+        sdhci.reset_all()?;
+
+        if (sdhci.read_present_state() & SDHCI_CARD_INSERTED) == 0 {
+            /* Some controllers do not wire up card-detect; do not fail
+             * outright, but warn since the rest of the sequence will fail
+             * if no card is actually present. */
+            println!("SDHCI: card-detect line reports no card inserted");
+        }
+
+        /* Enable the bus power supply at the highest voltage the
+         * controller advertises support for (typically 3.3V). */
+        sdhci.set_power(0b111);
+
+        /* Bring the clock up to the card identification frequency
+         * (400KHz, per the SD specification) before issuing any command. */
+        sdhci.set_clock(400_000)?;
+
+        sdhci.write8(SDHCI_TIMEOUT_CONTROL, 0x0E);
+
+        /* Clear and then unmask every status bit we rely on. */
+        sdhci.write16(SDHCI_INT_STATUS, 0xFFFF);
+        sdhci.write16(SDHCI_INT_ENABLE, 0xFFFF);
+        /* Signal Enable is intentionally left at 0: we poll INT_STATUS
+         * instead of relying on the physical IRQ line. */
+        sdhci.write16(SDHCI_SIGNAL_ENABLE, 0);
+
+        sdhci.initialize_card()?;
+        Ok(sdhci)
+    }
+
+    /* ---- Low level register access ---- */
+
+    fn read32(&self, offset: usize) -> u32 {
+        unsafe { read_volatile((self.base_address + offset) as *const u32) }
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        unsafe { write_volatile((self.base_address + offset) as *mut u32, value) }
+    }
+
+    fn read16(&self, offset: usize) -> u16 {
+        unsafe { read_volatile((self.base_address + offset) as *const u16) }
+    }
+
+    fn write16(&self, offset: usize, value: u16) {
+        unsafe { write_volatile((self.base_address + offset) as *mut u16, value) }
+    }
+
+    fn write8(&self, offset: usize, value: u8) {
+        unsafe { write_volatile((self.base_address + offset) as *mut u8, value) }
+    }
+
+    fn read_present_state(&self) -> u32 {
+        self.read32(SDHCI_PRESENT_STATE)
+    }
+
+    /* ---- Initialization helpers ---- */
+
+    fn reset_all(&self) -> Result<(), ()> {
+        self.write8(SDHCI_SOFTWARE_RESET, SDHCI_RESET_ALL);
+        for _ in 0..POLL_TIMEOUT {
+            if (unsafe { read_volatile((self.base_address + SDHCI_SOFTWARE_RESET) as *const u8) }
+                & SDHCI_RESET_ALL)
+                == 0
+            {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        println!("SDHCI: timed out waiting for the software reset to complete");
+        Err(())
+    }
+
+    fn set_power(&self, voltage_select: u8) {
+        /* SD Bus Voltage Select (bits[3:1]) followed by SD Bus Power (bit0). */
+        self.write8(SDHCI_POWER_CONTROL, (voltage_select << 1) | 1);
+    }
+
+    /// Programs the SDCLK divider so that the resulting card clock is at
+    /// most `target_hz`, following the standard SDHCI "divided clock mode"
+    /// algorithm (matches Linux/U-Boot's generic `sdhci_set_clock`).
+    fn set_clock(&self, target_hz: u32) -> Result<(), ()> {
+        /* Stop the card clock while it is being reconfigured. */
+        self.write16(SDHCI_CLOCK_CONTROL, 0);
+
+        let base_clock_mhz = (self.read32(SDHCI_CAPABILITIES) >> 8) & 0xFF;
+        let base_clock_hz = if base_clock_mhz == 0 {
+            /* Capabilities did not advertise a base clock (allowed by the
+             * spec for some platforms); BCM2711's EMMC2 is normally clocked
+             * at 100MHz, so fall back to that. */
+            100_000_000
+        } else {
+            base_clock_mhz * 1_000_000
+        };
+
+        let mut divisor: u32 = 1;
+        while divisor < 0x3FF && (base_clock_hz / (divisor * 2)) > target_hz {
+            divisor *= 2;
+        }
+        /* The register field encodes "divide by 2*N"; N=0 selects the base
+         * clock unmodified. */
+        let field = divisor / 2;
+
+        let clock_control = ((field & 0xFF) << 8) as u16 | (((field >> 8) & 0x03) << 6) as u16;
+        self.write16(SDHCI_CLOCK_CONTROL, clock_control | SDHCI_CLOCK_INT_EN);
+
+        for _ in 0..POLL_TIMEOUT {
+            if (self.read16(SDHCI_CLOCK_CONTROL) & SDHCI_CLOCK_INT_STABLE) != 0 {
+                self.write16(
+                    SDHCI_CLOCK_CONTROL,
+                    self.read16(SDHCI_CLOCK_CONTROL) | SDHCI_CLOCK_CARD_EN,
+                );
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        println!("SDHCI: internal clock never became stable");
+        Err(())
+    }
+
+    /* ---- Command layer ---- */
+
+    fn wait_for_not_inhibited(&self, mask: u32) -> Result<(), ()> {
+        for _ in 0..POLL_TIMEOUT {
+            if (self.read_present_state() & mask) == 0 {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+        Err(())
+    }
+
+    fn wait_for_interrupt(&self, mask: u16) -> Result<u16, ()> {
+        for _ in 0..POLL_TIMEOUT {
+            let status = self.read16(SDHCI_INT_STATUS);
+            if (status & SDHCI_INT_ERROR) != 0 {
+                /* W1C: acknowledge every raised status bit. */
+                self.write16(SDHCI_INT_STATUS, status);
+                return Err(());
+            }
+            if (status & mask) != 0 {
+                self.write16(SDHCI_INT_STATUS, status & mask);
+                return Ok(status);
+            }
+            core::hint::spin_loop();
+        }
+        Err(())
+    }
+
+    /// Issues a command and returns its response (zero-padded to 4 words;
+    /// only the low word is meaningful for R1/R1b/R3/R6/R7).
+    fn send_command(
+        &self,
+        index: u8,
+        argument: u32,
+        response_type: ResponseType,
+        data_present: bool,
+    ) -> Result<[u32; 4], ()> {
+        self.wait_for_not_inhibited(SDHCI_CMD_INHIBIT)?;
+        if data_present || response_type == ResponseType::R48Busy {
+            self.wait_for_not_inhibited(SDHCI_DAT_INHIBIT)?;
+        }
+
+        self.write16(SDHCI_INT_STATUS, 0xFFFF);
+        self.write32(SDHCI_ARGUMENT, argument);
+
+        let response_select = match response_type {
+            ResponseType::None => SDHCI_CMD_RESP_NONE,
+            ResponseType::R48 => SDHCI_CMD_RESP_48 | SDHCI_CMD_CRC_CHECK | SDHCI_CMD_INDEX_CHECK,
+            ResponseType::R48Busy => {
+                SDHCI_CMD_RESP_48_BUSY | SDHCI_CMD_CRC_CHECK | SDHCI_CMD_INDEX_CHECK
+            }
+            ResponseType::R136 => SDHCI_CMD_RESP_136 | SDHCI_CMD_CRC_CHECK,
+        };
+        let mut command = ((index as u16) << 8) | response_select;
+        if data_present {
+            command |= SDHCI_CMD_DATA_PRESENT;
+        }
+        self.write16(SDHCI_COMMAND, command);
+
+        self.wait_for_interrupt(SDHCI_INT_RESPONSE)
+            .map_err(|_| println!("SDHCI: CMD{index} timed out or failed"))?;
+
+        if response_type == ResponseType::R136 {
+            /* The CRC is not delivered to software; reconstruct the 128-bit
+             * response by shifting each register up by 8 bits and pulling
+             * in the top byte of the next one (matches U-Boot's
+             * sdhci_send_command()). */
+            let raw = [
+                self.read32(SDHCI_RESPONSE),
+                self.read32(SDHCI_RESPONSE + 4),
+                self.read32(SDHCI_RESPONSE + 8),
+                self.read32(SDHCI_RESPONSE + 12),
+            ];
+            let mut response = [0u32; 4];
+            for i in 0..4 {
+                response[i] = raw[3 - i] << 8;
+                if i != 3 {
+                    response[i] |= raw[3 - i - 1] >> 24;
+                }
+            }
+            Ok(response)
+        } else {
+            Ok([self.read32(SDHCI_RESPONSE), 0, 0, 0])
+        }
+    }
+
+    fn app_command(
+        &self,
+        index: u8,
+        argument: u32,
+        response_type: ResponseType,
+    ) -> Result<[u32; 4], ()> {
+        /* CMD55 must carry the currently selected card's RCA. */
+        self.send_command(CMD_APP_CMD, self.rca << 16, ResponseType::R48, false)?;
+        self.send_command(index, argument, response_type, false)
+    }
+
+    fn initialize_card(&mut self) -> Result<(), ()> {
+        /* CMD0: GO_IDLE_STATE */
+        self.send_command(CMD_GO_IDLE_STATE, 0, ResponseType::None, false)?;
+
+        /* CMD8: SEND_IF_COND - probes for a v2.00+ card and picks the
+         * 2.7-3.6V voltage range. Older (v1) cards do not respond to this
+         * command; treat a failure as "legacy card" rather than an error. */
+        let is_v2_or_later = self
+            .send_command(
+                CMD_SEND_IF_COND,
+                CMD8_VOLTAGE_CHECK_PATTERN,
+                ResponseType::R48,
+                false,
+            )
+            .is_ok();
+
+        /* ACMD41: SD_SEND_OP_COND - poll until the card leaves the busy
+         * state, requesting High Capacity Support so SDHC/SDXC cards report
+         * block instead of byte addressing. */
+        let mut ocr = 0;
+        let mut ready = false;
+        for _ in 0..ACMD41_RETRIES {
+            let argument = ACMD41_VOLTAGE_WINDOW | if is_v2_or_later { ACMD41_HCS } else { 0 };
+            let response = self.app_command(ACMD_SD_SEND_OP_COND, argument, ResponseType::R48)?;
+            ocr = response[0];
+            if (ocr & OCR_BUSY) != 0 {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            println!("SDHCI: card did not leave the busy state (no card inserted?)");
+            return Err(());
+        }
+        self.is_high_capacity = is_v2_or_later && (ocr & OCR_CCS) != 0;
+
+        /* CMD2: ALL_SEND_CID */
+        self.send_command(CMD_ALL_SEND_CID, 0, ResponseType::R136, false)?;
+
+        /* CMD3: SEND_RELATIVE_ADDR */
+        let response = self.send_command(CMD_SEND_RELATIVE_ADDR, 0, ResponseType::R48, false)?;
+        self.rca = response[0] >> 16;
+
+        /* CMD7: SELECT_CARD */
+        self.send_command(CMD_SELECT_CARD, self.rca << 16, ResponseType::R48Busy, false)?;
+
+        /* ACMD6: SET_BUS_WIDTH - switch to the 4-bit data bus. */
+        self.app_command(ACMD_SET_BUS_WIDTH, 0b10, ResponseType::R48)?;
+        self.write8(
+            0x28, /* Host Control 1 */
+            unsafe { read_volatile((self.base_address + 0x28) as *const u8) } | (1 << 1),
+        );
+
+        /* SDSC cards address by byte offset and need an explicit block
+         * length; SDHC/SDXC cards are fixed at 512 bytes. */
+        if !self.is_high_capacity {
+            self.send_command(
+                CMD_SET_BLOCKLEN,
+                BLOCK_SIZE as u32,
+                ResponseType::R48,
+                false,
+            )?;
+        }
+
+        /* Raise the clock from the identification frequency (400KHz) to a
+         * conservative default speed (25MHz "Default Speed" mode, valid on
+         * every SD card without needing a CMD6 speed-class switch). */
+        self.set_clock(25_000_000)?;
+
+        println!(
+            "SDHCI: card ready (RCA={:#X}, {})",
+            self.rca,
+            if self.is_high_capacity {
+                "block-addressed (SDHC/SDXC)"
+            } else {
+                "byte-addressed (SDSC)"
+            }
+        );
+        Ok(())
+    }
+
+    /// Converts a byte offset (as used by [`crate::fat32`]) into the block
+    /// index/offset argument expected by CMD17/18/24/25 for this card.
+    fn command_argument(&self, block_address: u64) -> u32 {
+        if self.is_high_capacity {
+            (block_address / BLOCK_SIZE as u64) as u32
+        } else {
+            block_address as u32
+        }
+    }
+
+    fn pio_transfer(
+        &self,
+        buffer_address: usize,
+        number_of_blocks: u32,
+        is_write: bool,
+    ) -> Result<(), ()> {
+        for block in 0..number_of_blocks {
+            let ready_bit = if is_write {
+                SDHCI_INT_BUFFER_WRITE_READY
+            } else {
+                SDHCI_INT_BUFFER_READ_READY
+            };
+            self.wait_for_interrupt(ready_bit)
+                .map_err(|_| println!("SDHCI: PIO buffer not ready for block {block}"))?;
+
+            let block_base = buffer_address + (block as usize) * BLOCK_SIZE;
+            for word in 0..(BLOCK_SIZE / size_of::<u32>()) {
+                let address = block_base + word * size_of::<u32>();
+                if is_write {
+                    let value = unsafe { read_volatile(address as *const u32) };
+                    self.write32(SDHCI_BUFFER, value);
+                } else {
+                    let value = self.read32(SDHCI_BUFFER);
+                    unsafe { write_volatile(address as *mut u32, value) };
+                }
+            }
+        }
+
+        self.wait_for_interrupt(SDHCI_INT_DATA_END)
+            .map_err(|_| println!("SDHCI: transfer did not complete"))?;
+
+        /* Present bit-check helper reads back the read-write flags to
+         * ensure the buffer window has actually closed before returning. */
+        let _ = self
+            .read_present_state()
+            &(SDHCI_BUFFER_READ_ENABLE | SDHCI_BUFFER_WRITE_ENABLE);
+        Ok(())
+    }
+
+    fn operation_sync(
+        &mut self,
+        buffer_address: usize,
+        block_address: u64,
+        length: u64,
+        is_write: bool,
+    ) -> Result<(), ()> {
+        if (block_address % BLOCK_SIZE as u64) != 0 || (length % BLOCK_SIZE as u64) != 0 {
+            println!(
+                "Block Address({:#X}) and Length({:#X}) must be 512Byte-Aligned.",
+                block_address, length
+            );
+            return Err(());
+        }
+        let number_of_blocks = (length / BLOCK_SIZE as u64) as u32;
+        if number_of_blocks == 0 {
+            return Ok(());
+        }
+
+        self.write16(SDHCI_BLOCK_SIZE, BLOCK_SIZE as u16);
+        self.write16(SDHCI_BLOCK_COUNT, number_of_blocks as u16);
+
+        let mut transfer_mode = SDHCI_TRNS_BLK_CNT_EN;
+        if !is_write {
+            transfer_mode |= SDHCI_TRNS_READ;
+        }
+        let is_multiple = number_of_blocks > 1;
+        if is_multiple {
+            transfer_mode |= SDHCI_TRNS_MULTI | SDHCI_TRNS_ACMD12;
+        }
+        self.write16(SDHCI_TRANSFER_MODE, transfer_mode);
+
+        let command_index = if is_write {
+            if is_multiple {
+                CMD_WRITE_MULTIPLE_BLOCK
+            } else {
+                CMD_WRITE_BLOCK
+            }
+        } else if is_multiple {
+            CMD_READ_MULTIPLE_BLOCK
+        } else {
+            CMD_READ_SINGLE_BLOCK
+        };
+
+        self.send_command(
+            command_index,
+            self.command_argument(block_address),
+            ResponseType::R48,
+            true,
+        )?;
+
+        let result = self.pio_transfer(buffer_address, number_of_blocks, is_write);
+
+        if is_multiple {
+            /* Auto CMD12 (SDHCI_TRNS_ACMD12) already asks the controller to
+             * issue STOP_TRANSMISSION on our behalf; nothing left to do
+             * here. Kept as an explicit branch for readability/robustness
+             * in case a future controller quirk needs manual CMD12. */
+            let _ = CMD_STOP_TRANSMISSION;
+        }
+
+        result
+    }
+
+    pub fn read(
+        &mut self,
+        buffer_address: usize,
+        block_address: u64,
+        length: u64,
+    ) -> Result<(), ()> {
+        self.operation_sync(buffer_address, block_address, length, false)
+    }
+
+    pub fn write(
+        &mut self,
+        buffer_address: usize,
+        block_address: u64,
+        length: u64,
+    ) -> Result<(), ()> {
+        self.operation_sync(buffer_address, block_address, length, true)
+    }
+}
+
+unsafe impl core::marker::Send for Sdhci {}
+
+impl super::block_device::BlockDevice for Sdhci {
+    fn read(&mut self, buffer_address: usize, block_address: u64, length: u64) -> Result<(), ()> {
+        Sdhci::read(self, buffer_address, block_address, length)
+    }
+
+    fn write(&mut self, buffer_address: usize, block_address: u64, length: u64) -> Result<(), ()> {
+        Sdhci::write(self, buffer_address, block_address, length)
+    }
+}

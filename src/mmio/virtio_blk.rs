@@ -161,9 +161,9 @@ impl VirtioBlkMmio {
                 let mut virtio_blk = VIRTIO_BLK.lock();
                 let fat32 = unsafe { (&raw mut FAT32).as_mut().unwrap().assume_init_mut() };
                 let result = if is_write {
-                    fat32.write(&self.file, &mut virtio_blk, address, offset, size as usize)
+                    fat32.write(&self.file, &mut *virtio_blk, address, offset, size as usize)
                 } else {
-                    fat32.read(&self.file, &mut virtio_blk, address, offset, size as usize)
+                    fat32.read(&self.file, &mut *virtio_blk, address, offset, size as usize)
                 };
                 if result.is_err() {
                     println!(

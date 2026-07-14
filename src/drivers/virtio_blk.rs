@@ -273,3 +273,13 @@ impl VirtioBlk {
 }
 
 unsafe impl core::marker::Send for VirtioBlk {}
+
+impl crate::drivers::block_device::BlockDevice for VirtioBlk {
+    fn read(&mut self, buffer_address: usize, block_address: u64, length: u64) -> Result<(), ()> {
+        VirtioBlk::read(self, buffer_address, block_address, length)
+    }
+
+    fn write(&mut self, buffer_address: usize, block_address: u64, length: u64) -> Result<(), ()> {
+        VirtioBlk::write(self, buffer_address, block_address, length)
+    }
+}

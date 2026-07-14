@@ -3,10 +3,10 @@
 //!
 
 use crate::asm;
+use crate::drivers::block_device::BlockDevice;
 use crate::drivers::{
     generic_timer,
     gicv2::{GicDistributor, GicHypervisorInterface},
-    virtio_blk::VirtioBlk,
 };
 use crate::fat32::Fat32;
 use crate::lock::Mutex;
@@ -156,7 +156,7 @@ impl MmioEntry {
 
 pub fn create_vm(
     fat32: &Fat32,
-    blk: &mut VirtioBlk,
+    blk: &mut dyn BlockDevice,
     gic_distributor: &GicDistributor,
     gic_hypervisor_interface: &GicHypervisorInterface,
     gic_virtual_cpu_interface_physical_address: usize,

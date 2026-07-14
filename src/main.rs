@@ -6,12 +6,15 @@ extern crate alloc;
 #[macro_use]
 mod serial;
 mod asm;
+mod block_backend;
 mod console;
 mod dtb;
 mod drivers {
+    pub mod block_device;
     pub mod generic_timer;
     pub mod gicv2;
     pub mod pl011;
+    pub mod sdhci;
     pub mod virtio;
     pub mod virtio_blk;
     pub mod virtio_net;
@@ -33,6 +36,7 @@ mod registers;
 mod vgic;
 mod vm;
 
+use block_backend::BlockBackend;
 use drivers::{generic_timer, gicv2, pl011, virtio_blk, virtio_net};
 use lock::Mutex;
 use psci::PsciErrorCodes;
@@ -51,7 +55,7 @@ static PL011_DEVICE: Mutex<pl011::Pl011> = Mutex::new(pl011::Pl011::invalid());
 static mut PL011_INT_ID: u32 = 0;
 static MEMORY_ALLOCATOR: Mutex<memory_allocator::MemoryAllocator> =
     Mutex::new(memory_allocator::MemoryAllocator::new());
-static VIRTIO_BLK: Mutex<virtio_blk::VirtioBlk> = Mutex::new(virtio_blk::VirtioBlk::invalid());
+static VIRTIO_BLK: Mutex<BlockBackend> = Mutex::new(BlockBackend::invalid());
 static VIRTIO_NET: Mutex<Option<virtio_net::VirtioNet>> = Mutex::new(None);
 static mut VIRTIO_NET_INT_ID: u32 = 0;
 static mut FAT32: MaybeUninit<fat32::Fat32> = MaybeUninit::uninit();
@@ -111,12 +115,16 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
 
     generic_timer::init_generic_timer_global(&dtb);
 
-    /* Platforms without a Virtio-Blk device (e.g. physical Raspberry Pi 4,
-     * which has no virtio hardware) cannot load a guest image yet. Report
-     * this clearly instead of panicking, so that console/GIC/UART/SMP
-     * bring-up can still be verified on such platforms. */
-    let Some(mut virtblk) = init_virtio_blk(&dtb) else {
-        println!("Virtio-Blk device is not present.");
+    /* Prefer a Virtio-Blk device (QEMU's `virt` machine); fall back to a
+     * physical SDHCI controller (e.g. Raspberry Pi 4's onboard microSD
+     * slot) when no virtio hardware is present. If neither is found,
+     * report this clearly instead of panicking, so that console/GIC/UART/
+     * SMP bring-up can still be verified on such platforms. */
+    let Some(mut virtblk) = init_virtio_blk(&dtb)
+        .map(BlockBackend::Virtio)
+        .or_else(|| init_sdhci(&dtb).map(BlockBackend::Sdhci))
+    else {
+        println!("No supported block-storage device (Virtio-Blk/SDHCI) was found.");
         println!("Guest storage/boot is not supported on this platform yet.");
         loop {
             core::hint::spin_loop();
@@ -390,6 +398,34 @@ fn init_virtio_blk(dtb: &dtb::Dtb) -> Option<virtio_blk::VirtioBlk> {
     }
 }
 
+/// Searches the DTB for an SDHCI-compatible microSD controller (e.g.
+/// Raspberry Pi 4's EMMC2, `compatible = "brcm,bcm2711-emmc2"`) and, if
+/// found and operational, initializes it and probes for a card.
+fn init_sdhci(dtb: &dtb::Dtb) -> Option<drivers::sdhci::Sdhci> {
+    const SDHCI_COMPATIBLE_LIST: &[&[u8]] =
+        &[b"brcm,bcm2711-emmc2", b"brcm,sdhci-brcmstb", b"generic-sdhci"];
+    for compatible in SDHCI_COMPATIBLE_LIST {
+        let mut node = None;
+        loop {
+            node = dtb.search_node_by_compatible(compatible, node.as_ref());
+            match &node {
+                Some(sdhci_node) => {
+                    if dtb.is_node_operational(sdhci_node)
+                        && let Some((base_address, _)) = dtb.read_reg_property(sdhci_node, 0)
+                    {
+                        match drivers::sdhci::Sdhci::new(base_address) {
+                            Ok(sdhci) => return Some(sdhci),
+                            Err(()) => println!("Failed to initialize the SDHCI controller."),
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+    }
+    None
+}
+
 /// Default MAC address used when the physical Virtio-Net device does not
 /// support VIRTIO_NET_F_MAC (locally administered, QEMU/virtual convention).
 const DEFAULT_MAC_ADDRESS: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
@@ -458,7 +494,7 @@ fn handle_net_rx() {
 }
 
 
-pub fn init_fat32(blk: &mut virtio_blk::VirtioBlk) -> fat32::Fat32 {
+pub fn init_fat32(blk: &mut dyn drivers::block_device::BlockDevice) -> fat32::Fat32 {
     #[repr(C)]
     struct PartitionTableEntry {
         boot_flag: u8,
@@ -599,7 +635,7 @@ extern "C" fn core_main() -> ! {
 
     let (boot_address, argument) = vm::create_vm(
         unsafe { (&raw const FAT32).as_ref().unwrap().assume_init_ref() },
-        &mut VIRTIO_BLK.lock(),
+        &mut *VIRTIO_BLK.lock(),
         &distributor,
         &gic_hypervisor_interface,
         gicv_base_address,
