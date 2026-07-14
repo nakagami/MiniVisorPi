@@ -7,11 +7,11 @@ VERSION="11.0.2"
 rm -rf $QEMU_DIR
 mkdir -p $QEMU_DIR
 
-sudo env DEBIAN_FRONTEND=noninteractive apt install -y libssl-dev python3-venv ninja-build libglib2.0-dev libcapstone-dev
+sudo env DEBIAN_FRONTEND=noninteractive apt install -y libssl-dev python3-venv ninja-build libglib2.0-dev libcapstone-dev libslirp-dev
 curl https://download.qemu.org/qemu-$VERSION.tar.xz | tar xvJf -
 
 pushd qemu-$VERSION
-./configure --target-list=aarch64-softmmu --prefix=$QEMU_DIR
+./configure --target-list=aarch64-softmmu --prefix=$QEMU_DIR --enable-slirp
 make -j$(nproc)
 make install
 popd

@@ -8,7 +8,9 @@ pub const VIRTIO_MMIO_VERSION: usize = 0x04;
 pub const VIRTIO_MMIO_DEVICE_ID: usize = 0x008;
 pub const VIRTIO_MMIO_VENDOR_ID: usize = 0x00c;
 pub const VIRTIO_MMIO_DEVICE_FEATURES: usize = 0x010;
+pub const VIRTIO_MMIO_DEVICE_FEATURES_SEL: usize = 0x014;
 pub const VIRTIO_MMIO_DRIVER_FEATURES: usize = 0x020;
+pub const VIRTIO_MMIO_DRIVER_FEATURES_SEL: usize = 0x024;
 pub const VIRTIO_MMIO_GUEST_PAGE_SIZE: usize = 0x028;
 pub const VIRTIO_MMIO_QUEUE_SEL: usize = 0x030;
 pub const VIRTIO_MMIO_QUEUE_NUM_MAX: usize = 0x034;
@@ -19,6 +21,9 @@ pub const VIRTIO_MMIO_QUEUE_NOTIFY: usize = 0x050;
 pub const VIRTIO_MMIO_INTERRUPT_STATUS: usize = 0x060;
 pub const VIRTIO_MMIO_INTERRUPT_ACK: usize = 0x064;
 pub const VIRTIO_MMIO_STATUS: usize = 0x070;
+
+pub const VIRTIO_ID_NET: u32 = 1;
+pub const VIRTIO_ID_BLOCK: u32 = 2;
 
 pub const VIRTIO_CONFIG_OFFSET: usize = 0x100;
 

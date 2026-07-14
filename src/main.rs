@@ -14,6 +14,7 @@ mod drivers {
     pub mod pl011;
     pub mod virtio;
     pub mod virtio_blk;
+    pub mod virtio_net;
 }
 mod elf;
 mod exception;
@@ -24,6 +25,7 @@ mod mmio {
     pub mod gicv2;
     pub mod pl011;
     pub mod virtio_blk;
+    pub mod virtio_net;
 }
 mod paging;
 mod psci;
@@ -31,7 +33,7 @@ mod registers;
 mod vgic;
 mod vm;
 
-use drivers::{generic_timer, gicv2, pl011, virtio_blk};
+use drivers::{generic_timer, gicv2, pl011, virtio_blk, virtio_net};
 use lock::Mutex;
 use psci::PsciErrorCodes;
 use serial::SerialDevice;
@@ -50,6 +52,8 @@ static mut PL011_INT_ID: u32 = 0;
 static MEMORY_ALLOCATOR: Mutex<memory_allocator::MemoryAllocator> =
     Mutex::new(memory_allocator::MemoryAllocator::new());
 static VIRTIO_BLK: Mutex<virtio_blk::VirtioBlk> = Mutex::new(virtio_blk::VirtioBlk::invalid());
+static VIRTIO_NET: Mutex<Option<virtio_net::VirtioNet>> = Mutex::new(None);
+static mut VIRTIO_NET_INT_ID: u32 = 0;
 static mut FAT32: MaybeUninit<fat32::Fat32> = MaybeUninit::uninit();
 #[global_allocator]
 static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {};
@@ -110,6 +114,8 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     let mut virtblk = init_virtio_blk(&dtb).unwrap();
     let fat32 = init_fat32(&mut virtblk);
 
+    let (net, net_int_id, net_mac) = init_virtio_net(&dtb);
+
     let (boot_address, argument) = vm::create_vm(
         &fat32,
         &mut virtblk,
@@ -117,7 +123,15 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
         &gic_hypervisor_interface,
         gicv_base_address,
         gicv_size,
+        net_mac,
     );
+
+    /* The physical VM is now active: it is now safe to enable the
+     * Virtio-Net interrupt, since handle_net_rx() requires an active VM. */
+    *VIRTIO_NET.lock() = net;
+    if let Some(int_id) = net_int_id {
+        enable_net_interrupt(int_id, &distributor);
+    }
 
     *VIRTIO_BLK.lock() = virtblk;
     unsafe {
@@ -352,6 +366,74 @@ fn init_virtio_blk(dtb: &dtb::Dtb) -> Option<virtio_blk::VirtioBlk> {
     }
 }
 
+/// Default MAC address used when the physical Virtio-Net device does not
+/// support VIRTIO_NET_F_MAC (locally administered, QEMU/virtual convention).
+const DEFAULT_MAC_ADDRESS: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+
+/// Searches the DTB for a `virtio,mmio` node backed by a Virtio-Net device,
+/// initializes the physical driver and returns it together with its GIC
+/// interrupt id (if any) and the MAC address to expose to the guest.
+fn init_virtio_net(dtb: &dtb::Dtb) -> (Option<virtio_net::VirtioNet>, Option<u32>, [u8; 6]) {
+    let mut node = None;
+    loop {
+        node = dtb.search_node_by_compatible(b"virtio,mmio", node.as_ref());
+        match &node {
+            Some(virtio) => {
+                if dtb.is_node_operational(virtio)
+                    && let Some((base_address, _)) = dtb.read_reg_property(virtio, 0)
+                    && let Ok(net) = virtio_net::VirtioNet::new(base_address)
+                {
+                    let mut int_id = None;
+                    if let Some(interrupts_property) = dtb.get_property(virtio, b"interrupts") {
+                        let interrupts = dtb.read_property_as_u32_array(&interrupts_property);
+                        if u32::from_be(interrupts[0]) == gicv2::DTB_GIC_SPI {
+                            int_id = Some(gicv2::GIC_SPI_BASE + u32::from_be(interrupts[1]));
+                        }
+                    }
+                    let mac = net.get_mac_address();
+                    let mac = if mac == [0u8; 6] { DEFAULT_MAC_ADDRESS } else { mac };
+                    return (Some(net), int_id, mac);
+                }
+            }
+            None => {
+                println!("Virtio-Net device is not present.");
+                return (None, None, DEFAULT_MAC_ADDRESS);
+            }
+        }
+    }
+}
+
+/// Enables the physical Virtio-Net RX interrupt. Must only be called once a
+/// VM is active, since the handler forwards packets into the current VM.
+fn enable_net_interrupt(int_id: u32, distributor: &gicv2::GicDistributor) {
+    distributor.set_group(int_id, gicv2::GicGroup::NonSecureGroup1);
+    distributor.set_priority(int_id, 0x00);
+    distributor.set_target(int_id, distributor.get_own_target());
+    /* Although the DTB advertises this line as edge-triggered, QEMU's
+     * virtio-mmio model keeps the physical IRQ asserted for as long as
+     * VIRTIO_MMIO_INTERRUPT_STATUS is non-zero (level semantics); configure
+     * the physical GIC accordingly so it stops re-presenting the interrupt
+     * once acknowledged (see VirtioNet::poll_rx's INTERRUPT_ACK write). */
+    distributor.set_trigger_mode(int_id, true);
+    distributor.set_pending(int_id, false);
+    distributor.set_enable(int_id, true);
+    unsafe { VIRTIO_NET_INT_ID = int_id };
+}
+
+/// Called from the physical Virtio-Net IRQ handler: drains every received
+/// Ethernet frame and forwards it to the currently active VM.
+fn handle_net_rx() {
+    let mut buffer = [0u8; drivers::virtio_net::VIRTIO_NET_RX_BUFFER_SIZE];
+    let mut net = VIRTIO_NET.lock();
+    let Some(net) = net.as_mut() else {
+        return;
+    };
+    while let Some(length) = net.poll_rx(&mut buffer) {
+        vm::input_net_packet(&buffer[..length]);
+    }
+}
+
+
 pub fn init_fat32(blk: &mut virtio_blk::VirtioBlk) -> fat32::Fat32 {
     #[repr(C)]
     struct PartitionTableEntry {
@@ -454,6 +536,7 @@ extern "C" fn core_main() -> ! {
         &gic_hypervisor_interface,
         gicv_base_address,
         gicv_size,
+        DEFAULT_MAC_ADDRESS,
     );
     vm::boot_vm(boot_address, argument)
 }

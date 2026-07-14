@@ -270,6 +270,8 @@ extern "C" fn irq_handler() {
     } else if interrupt_number == unsafe { generic_timer::GENERIC_TIMER_PHYSICAL_INT_ID } {
         generic_timer::generic_timer_interrupt_handler();
         deactivate = false; /* Deactivate is handled by the VGIC */
+    } else if interrupt_number == unsafe { crate::VIRTIO_NET_INT_ID } {
+        crate::handle_net_rx();
     }
     GicCpuInterface::drop_priority(interrupt_number, group);
     if deactivate {

@@ -10,7 +10,10 @@ use crate::drivers::{
 };
 use crate::fat32::Fat32;
 use crate::lock::Mutex;
-use crate::mmio::{gicv2::GicDistributorMmio, pl011::Pl011Mmio, virtio_blk::VirtioBlkMmio};
+use crate::mmio::{
+    gicv2::GicDistributorMmio, pl011::Pl011Mmio, virtio_blk::VirtioBlkMmio,
+    virtio_net::VirtioNetMmio,
+};
 use crate::paging::*;
 use crate::registers::*;
 use crate::vgic;
@@ -40,6 +43,7 @@ pub struct VM {
     mmio_handlers: LinkedList<MmioEntry>,
     gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
     pl011_mmio: Arc<Mutex<Pl011Mmio>>,
+    virtio_net_mmio: Arc<Mutex<VirtioNetMmio>>,
 }
 
 #[repr(C)]
@@ -70,6 +74,7 @@ impl VM {
         mmio_handlers: LinkedList<MmioEntry>,
         gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
         pl011_mmio: Arc<Mutex<Pl011Mmio>>,
+        virtio_net_mmio: Arc<Mutex<VirtioNetMmio>>,
     ) -> Self {
         Self {
             vm_id,
@@ -79,6 +84,7 @@ impl VM {
             mmio_handlers,
             gic_distributor_mmio,
             pl011_mmio,
+            virtio_net_mmio,
         }
     }
 
@@ -128,6 +134,10 @@ impl VM {
     pub fn get_pl011_mmio(&self) -> &Mutex<Pl011Mmio> {
         &self.pl011_mmio
     }
+
+    pub fn get_virtio_net_mmio(&self) -> &Mutex<VirtioNetMmio> {
+        &self.virtio_net_mmio
+    }
 }
 
 impl MmioEntry {
@@ -151,6 +161,7 @@ pub fn create_vm(
     gic_hypervisor_interface: &GicHypervisorInterface,
     gic_virtual_cpu_interface_physical_address: usize,
     gic_virtual_cpu_interface_size: usize,
+    net_mac: [u8; 6],
 ) -> (usize, usize) {
     const RAM_VIRTUAL_BASE: usize = 0x40000000;
     /// RAM SIZE: 256MiB
@@ -220,6 +231,10 @@ pub fn create_vm(
         gic_distributor_mmio.clone(),
     ));
 
+    /* Virtio-Net */
+    let virtio_net_mmio = Arc::new(Mutex::new(VirtioNetMmio::new(net_mac)));
+    mmio_handlers.push_back(MmioEntry::new(0xa000200, 0x0200, virtio_net_mmio.clone()));
+
     /* Create the VM structure */
     let vm = VM::new(
         vm_id,
@@ -229,6 +244,7 @@ pub fn create_vm(
         mmio_handlers,
         gic_distributor_mmio,
         pl011_mmio,
+        virtio_net_mmio,
     );
 
     /* Load the Linux kernel and devicetree */
@@ -297,6 +313,12 @@ pub fn input_uart(c: u8) {
     vm.get_pl011_mmio()
         .lock()
         .push(c, &mut vm.get_gic_distributor_mmio().lock());
+}
+
+/// Injects a received Ethernet frame into the current VM's Virtio-Net device.
+/// Called from the physical Virtio-Net interrupt handler.
+pub fn input_net_packet(data: &[u8]) {
+    get_current_vm().get_virtio_net_mmio().lock().push_rx(data);
 }
 
 pub fn get_current_vm() -> Arc<VM> {
