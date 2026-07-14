@@ -111,7 +111,17 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
 
     generic_timer::init_generic_timer_global(&dtb);
 
-    let mut virtblk = init_virtio_blk(&dtb).unwrap();
+    /* Platforms without a Virtio-Blk device (e.g. physical Raspberry Pi 4,
+     * which has no virtio hardware) cannot load a guest image yet. Report
+     * this clearly instead of panicking, so that console/GIC/UART/SMP
+     * bring-up can still be verified on such platforms. */
+    let Some(mut virtblk) = init_virtio_blk(&dtb) else {
+        println!("Virtio-Blk device is not present.");
+        println!("Guest storage/boot is not supported on this platform yet.");
+        loop {
+            core::hint::spin_loop();
+        }
+    };
     let fat32 = init_fat32(&mut virtblk);
 
     let (net, net_int_id, net_mac) = init_virtio_net(&dtb);
@@ -290,10 +300,24 @@ pub fn free_pages(address: usize, number_of_pages: usize) {
         .free(address, number_of_pages << paging::PAGE_SHIFT);
 }
 
-const GIC_COMPATIBLE: &[u8] = b"arm,cortex-a15-gic";
+/// Compatible strings for the GICv2 (with Virtualization Extensions) node.
+/// QEMU's `virt` machine advertises "arm,cortex-a15-gic", while Raspberry Pi 4
+/// (BCM2711)'s GIC-400 advertises "arm,gic-400". Both expose the same 4 MMIO
+/// regions (Distributor / CPU Interface / Hypervisor Interface / Virtual CPU
+/// Interface) in the same order, so the rest of the driver is unchanged.
+const GIC_COMPATIBLE_LIST: &[&[u8]] = &[b"arm,cortex-a15-gic", b"arm,gic-400"];
+
+fn find_gic_node(dtb: &dtb::Dtb) -> dtb::DtbNode {
+    for compatible in GIC_COMPATIBLE_LIST {
+        if let Some(node) = dtb.search_node_by_compatible(compatible, None) {
+            return node;
+        }
+    }
+    panic!("No compatible GICv2 node found in the DTB");
+}
 
 fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv2::GicDistributor {
-    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 0).unwrap();
     println!("GIC Distributor's Base Address: {:#X}", base_address);
     let gic_distributor = gicv2::GicDistributor::new(base_address, size).unwrap();
@@ -302,7 +326,7 @@ fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv2::GicDistributor {
 }
 
 fn init_gic_cpu_interface(dtb: &dtb::Dtb) -> gicv2::GicCpuInterface {
-    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 1).unwrap();
     if size < gicv2::GicCpuInterface::GICC_MMIO_SIZE {
         panic!("Invalid GICC Size: {:#X}", size);
@@ -314,7 +338,7 @@ fn init_gic_cpu_interface(dtb: &dtb::Dtb) -> gicv2::GicCpuInterface {
 }
 
 fn init_gic_hypervisor_interface(dtb: &dtb::Dtb) -> gicv2::GicHypervisorInterface {
-    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 2).unwrap();
     if size < gicv2::GicHypervisorInterface::GICH_MMIO_SIZE {
         panic!("Invalid GICH Size: {:#X}", size);
@@ -326,7 +350,7 @@ fn init_gic_hypervisor_interface(dtb: &dtb::Dtb) -> gicv2::GicHypervisorInterfac
 /// Gets the physical address of the GICv2 Virtual CPU Interface (GICV).
 /// (Used to map it via Stage 2 passthrough to the address corresponding to the guest's GICC)
 fn get_gic_virtual_cpu_interface(dtb: &dtb::Dtb) -> (usize, usize) {
-    let gic_node = dtb.search_node_by_compatible(GIC_COMPATIBLE, None).unwrap();
+    let gic_node = find_gic_node(dtb);
     dtb.read_reg_property(&gic_node, 3).unwrap()
 }
 
@@ -500,6 +524,27 @@ pub fn launch_cpu() -> bool {
         if let Some((affinity, _)) = dtb.read_reg_property(&cpu, 0)
             && current_affinity != affinity as u64
         {
+            if is_spin_table_enable_method(dtb, &cpu) {
+                /* Platforms without PSCI firmware (e.g. Raspberry Pi 4's
+                 * stock firmware) bring secondary cores up through the
+                 * ARM "spin-table" protocol instead. There is no
+                 * acknowledgement from the platform, so assume success
+                 * once the release address has been armed. */
+                let Some(release_address) = read_cpu_release_address(dtb, &cpu) else {
+                    println!(
+                        "CPU(Affinity: {:#X}) is missing a valid cpu-release-addr",
+                        affinity
+                    );
+                    cpu_node = Some(cpu);
+                    continue;
+                };
+                println!(
+                    "Starting CPU(Affinity: {:#X}) via spin-table (release address: {:#X})",
+                    affinity, release_address
+                );
+                psci::spin_table_cpu_on(release_address, stack_address as u64);
+                return true;
+            }
             match psci::cpu_on(
                 affinity as u64,
                 asm::core_entry as *const fn() as usize as u64,
@@ -516,6 +561,29 @@ pub fn launch_cpu() -> bool {
     }
     free_pages(stack_address - STACK_SIZE, STACK_SIZE >> paging::PAGE_SHIFT);
     false
+}
+
+/// Checks whether a `cpu` DTB node advertises the ARM "spin-table" boot
+/// protocol (`enable-method = "spin-table"`) instead of PSCI.
+fn is_spin_table_enable_method(dtb: &dtb::Dtb, cpu: &dtb::DtbNode) -> bool {
+    let Some(property) = dtb.get_property(cpu, b"enable-method") else {
+        return false;
+    };
+    dtb.read_property_as_u8_array(&property).starts_with(b"spin-table")
+}
+
+/// Reads a `cpu` DTB node's `cpu-release-addr` property (always encoded as
+/// a single 64-bit big-endian value, regardless of the parent bus's
+/// `#address-cells`, per the ARM spin-table boot protocol binding).
+fn read_cpu_release_address(dtb: &dtb::Dtb, cpu: &dtb::DtbNode) -> Option<usize> {
+    let property = dtb.get_property(cpu, b"cpu-release-addr")?;
+    let cells = dtb.read_property_as_u32_array(&property);
+    if cells.len() < 2 {
+        return None;
+    }
+    let high = u32::from_be(cells[0]) as u64;
+    let low = u32::from_be(cells[1]) as u64;
+    Some(((high << 32) | low) as usize)
 }
 
 extern "C" fn core_main() -> ! {

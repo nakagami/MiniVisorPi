@@ -162,6 +162,36 @@ pub extern "C" fn core_entry() -> ! {
     )
 }
 
+/// Data Synchronization Barrier (waits for prior memory accesses to complete).
+pub unsafe fn dsb_sy() {
+    unsafe { asm!("dsb sy") };
+}
+
+/// Signals an event, used to wake up CPUs parked in a `wfe` spin loop
+/// (e.g. the platform firmware's ARM "spin-table" boot protocol holding pen).
+pub unsafe fn sev() {
+    unsafe { asm!("sev") };
+}
+
+/// Entry point for CPUs woken up through the ARM "spin-table" boot protocol
+/// (used, e.g., by Raspberry Pi 4's firmware instead of PSCI). Unlike
+/// [`core_entry`], no register is guaranteed to hold a usable value when the
+/// firmware's holding pen jumps here, so the stack pointer is instead loaded
+/// from [`crate::psci::SPIN_TABLE_SP`], which must be written by the CPU
+/// bringing this core up *before* arming the spin-table release address.
+#[unsafe(naked)]
+pub extern "C" fn spin_table_entry() -> ! {
+    naked_asm!("
+            adrp x0, {sp}
+            add  x0, x0, :lo12:{sp}
+            ldr  x0, [x0]
+            mov  sp, x0
+            b    {main}",
+        sp = sym crate::psci::SPIN_TABLE_SP,
+        main = sym crate::core_main,
+    )
+}
+
 pub unsafe fn get_daif_and_disable_irq_fiq() -> u64 {
     let daif: u64;
     unsafe {

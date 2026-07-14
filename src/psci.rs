@@ -4,9 +4,18 @@
 
 use crate::asm::smc;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+
+/// Stack pointer to hand to a CPU woken up via the ARM "spin-table" boot
+/// protocol (see [`crate::asm::spin_table_entry`]). Must be written just
+/// before [`spin_table_cpu_on`] arms the release address, and is consumed
+/// exactly once by the waking core.
+pub static SPIN_TABLE_SP: AtomicU64 = AtomicU64::new(0);
+
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 pub enum PsciErrorCodes {
@@ -66,3 +75,23 @@ pub fn system_off() -> ! {
     unsafe { smc(PSCI_SYSTEM_OFF, 0, 0, 0) };
     unreachable!()
 }
+
+/// Brings up a secondary CPU using the ARM "spin-table" boot protocol,
+/// used by platforms without PSCI firmware (e.g. Raspberry Pi 4's stock
+/// firmware, whose `cpu` DTB nodes advertise
+/// `enable-method = "spin-table"` and a per-core `cpu-release-addr`).
+///
+/// `release_address` is the physical address read from the target CPU's
+/// `cpu-release-addr` DTB property: the platform firmware parks the core
+/// in a `wfe` loop polling that address, and jumps to whatever entry point
+/// is written there once woken with `sev`.
+pub fn spin_table_cpu_on(release_address: usize, stack_pointer: u64) {
+    SPIN_TABLE_SP.store(stack_pointer, Ordering::SeqCst);
+    let entry_point = crate::asm::spin_table_entry as *const () as u64;
+    unsafe {
+        core::ptr::write_volatile(release_address as *mut u64, entry_point);
+        crate::asm::dsb_sy();
+        crate::asm::sev();
+    }
+}
+
