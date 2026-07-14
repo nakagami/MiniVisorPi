@@ -72,6 +72,14 @@ impl MmioHandler for Pl011Mmio {
                 for i in 1..(self.read_buffer.len()) {
                     self.read_buffer[i - 1] = self.read_buffer[i];
                 }
+                /* The last slot vacated by the shift must be cleared; otherwise,
+                 * once the 4-byte FIFO fills up completely, the final received
+                 * byte never becomes 0 and keeps reappearing at the front on
+                 * every subsequent read, causing that character to repeat
+                 * forever and RXRIS to never clear (self.read_buffer[0] stays
+                 * non-zero). */
+                let last = self.read_buffer.len() - 1;
+                self.read_buffer[last] = 0;
                 if self.read_buffer[0] == 0 {
                     self.flag |= UART_FR_RXFE;
                     self.raw_interrupt_status &= !(UART_RIS_RXRIS);
