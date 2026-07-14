@@ -4,3 +4,10 @@ rustflags = ["-C", "link-arg=-Tscripts/qemu.ld"]
 
 [target.aarch64-unknown-none-softfloat]
 runner="tools/run_qemu.sh"
+
+# `cargo build-pi4` builds mini_visor and copies the resulting ELF into
+# bin-pi4/disk/mini.elf instead of launching QEMU. It is implemented as a
+# `cargo run` alias (with the runner overridden) because cargo only invokes
+# a target's runner on `cargo run`/`cargo test`, never on plain `cargo build`.
+[alias]
+build-pi4 = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner=\"tools-pi4/copy_minivisor.sh\""]
