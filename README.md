@@ -1,24 +1,11 @@
 # MiniVisor
 AArch64向けの小型Type1ハイパーバイザ
 
-本リポジトリは[作って理解する仮想化技術─⁠─ ハイパーバイザを実装しながら仕組みを学ぶ（技術評論社,2025）](https://gihyo.jp/book/2025/978-4-297-15012-9)で実装するハイパーバイザの公開リポジトリです。
+本リポジトリは[作って理解する仮想化技術─⁠─ ハイパーバイザを実装しながら仕組みを学ぶ（技術評論社,2025）](https://gihyo.jp/book/2025/978-4-297-15012-9)で実装するハイパーバイザを改造して Raspberry Pi 4 で動作することを目指すリポジトリです。
 
-## Issueについて
-書籍やMiniVisorの問題については、本リポジトリのIssueに使用している環境の情報を合わせて報告していただけると幸いです。
-
-開発環境は書籍で指定している環境以外はサポートしておりません。
-指定している環境以外での問題を報告されても、対応はできませんのでご了承ください。
-
-また、本リポジトリでは新規機能追加や改良等は行いません。
-新規機能追加や改良は本リポジトリをフォークして行ってください。
-
-## Pull Requestについて
-本リポジトリでは原則としてPull Requestを受け付けていません。
-書籍や本リポジトリの内容に問題がある場合は、Issueとしてご指摘ください。
-ご指摘いただいた内容を元に、書籍への影響などを考慮して修正を行います。
+書籍と同様の手順で QEMUの環境で動作しますが、`tools-pi4`以下のスクリプトを使うとRaspberry Pi 4実機向けの起動用SDカードイメージを作成できます。
 
 ## Raspberry Pi 4実機向けブートSDカードの作成手順
-書籍で指定している環境はQEMUですが、`tools-pi4`以下のスクリプトを使うとRaspberry Pi 4実機向けの起動用SDカードイメージを作成できます。
 
 1. u-boot(実機向け、`rpi_arm64_defconfig`)をビルドします。
    ```
@@ -37,7 +24,7 @@ AArch64向けの小型Type1ハイパーバイザ
    curl -L -o bin-pi4/disk/start4.elf https://github.com/raspberrypi/firmware/raw/master/boot/start4.elf
    curl -L -o bin-pi4/disk/fixup4.dat https://github.com/raspberrypi/firmware/raw/master/boot/fixup4.dat
    ```
-5. SDカードイメージ`bin-pi4/disk.img`を作成します(3.で`bin-pi4/disk/mini.elf`にコピー済みのものを使うため、引数は不要です)。
+5. SDカードイメージ`bin-pi4/disk.img`を作成します
    ```
    tools-pi4/create_sdcard.sh
    ```
@@ -48,7 +35,6 @@ AArch64向けの小型Type1ハイパーバイザ
    ```
 7. SDカードをRaspberry Pi 4に挿して起動します。
 
-Raspberry Pi 4実機向けの環境は書籍で指定している環境ではないため、Issueでの対応対象外です。あらかじめご了承ください。
 
 ## ライセンスについて
 本ソフトウェアはApache License, Version 2.0にてライセンスされています。
