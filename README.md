@@ -19,16 +19,19 @@ AArch64向けの小型Type1ハイパーバイザ
    ```
    cargo build-pi4
    ```
-4. Raspberry Pi公式のGPUファームウェア(`start4.elf`、`fixup4.dat`)を取得し、`bin-pi4/disk/`に配置します。本リポジトリではライセンスの都合上これらを配布していないため、[raspberrypi/firmware](https://github.com/raspberrypi/firmware/tree/master/boot)から取得してください。
+4. Raspberry Pi公式のGPUファームウェア(`start4.elf`、`fixup4.dat`)、公式デバイスツリー(`bcm2711-rpi-4-b.dtb`)、Bluetooth無効化用のデバイスツリーオーバーレイ(`disable-bt.dtbo`)を取得し、`bin-pi4/disk/`・`bin-pi4/disk/overlays/`に配置します。本リポジトリではライセンスの都合上これらを配布していないため、[raspberrypi/firmware](https://github.com/raspberrypi/firmware/tree/master/boot)から取得してください。デバイスツリーは必ずこの公式版を使用してください。u-bootのソースツリーに同梱されている`bcm2711-rpi-4-b.dtb`には`disable-bt.dtbo`が要求する`bt`・`uart0_pins`・`bt_pins`の`__symbols__`ラベルが存在せず、overlayの適用に失敗します。`disable-bt.dtbo`自体は、RPi4のPL011 UART(uart0)を初期状態のBluetoothモジュール向け配線からGPIO14/15ピンヘッダへ付け替えるために必要です(MiniVisorのシリアルドライバはPL011のみに対応しているため、これがないとコンソール出力がBluetooth側の配線へ流れて見えなくなります)。
    ```
    curl -L -o bin-pi4/disk/start4.elf https://github.com/raspberrypi/firmware/raw/master/boot/start4.elf
    curl -L -o bin-pi4/disk/fixup4.dat https://github.com/raspberrypi/firmware/raw/master/boot/fixup4.dat
+   curl -L -o bin-pi4/disk/bcm2711-rpi-4-b.dtb https://github.com/raspberrypi/firmware/raw/master/boot/bcm2711-rpi-4-b.dtb
+   mkdir -p bin-pi4/disk/overlays
+   curl -L -o bin-pi4/disk/overlays/disable-bt.dtbo https://github.com/raspberrypi/firmware/raw/master/boot/overlays/disable-bt.dtbo
    ```
 5. SDカードイメージ`bin-pi4/disk.img`を作成します
    ```
    tools-pi4/create_sdcard.sh
    ```
-   このスクリプトは`u-boot.bin`・デバイスツリー(`bcm2711-rpi-4-b.dtb`)・`config.txt`・`mini.elf`・`boot.scr`・Linuxカーネル(`Image`)・rootfs(`DISK0`)を含むFAT32イメージを`bin-pi4/disk.img`に生成します(4.で配置した`start4.elf`・`fixup4.dat`もそのまま含まれます)。
+   このスクリプトは`u-boot.bin`・`config.txt`・`mini.elf`・`boot.scr`・Linuxカーネル(`Image`)・rootfs(`DISK0`)を含むFAT32イメージを`bin-pi4/disk.img`に生成します(4.で配置した`bcm2711-rpi-4-b.dtb`・`start4.elf`・`fixup4.dat`・`overlays/disable-bt.dtbo`もそのまま含まれます)。
 6. 作成した`bin-pi4/disk.img`を物理SDカードに書き込みます。`/dev/sdX`は環境に合わせて読み替えてください。
    ```
    sudo dd if=bin-pi4/disk.img of=/dev/sdX bs=4M status=progress conv=fsync

@@ -7,7 +7,7 @@ if [ -z $CROSS_COMPILE ]; then
 fi
 
 rm -rf $U_BOOT_DIR
-git clone --depth=1 -b v2024.04 https://github.com/u-boot/u-boot.git $U_BOOT_DIR
+git clone --depth=1 -b v2026.07 https://github.com/u-boot/u-boot.git $U_BOOT_DIR
 
 pushd $U_BOOT_DIR
 # rpi_arm64_defconfig targets real Raspberry Pi 3/4 hardware in AArch64 mode

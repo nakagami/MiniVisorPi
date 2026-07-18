@@ -164,6 +164,15 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     vm::boot_vm(boot_address, argument)
 }
 
+/* Parses a u-boot-supplied argv string (always a memory address) as an
+ * unsigned integer. Addresses passed to this function are always expressed
+ * in hexadecimal, but not always with an explicit "0x" prefix: e.g. u-boot's
+ * $kernel_addr_r env var is formatted as "0x00080000", while $fdt_addr on
+ * Raspberry Pi hardware (set by the board's own init code, unlike QEMU) is
+ * formatted as a bare hex string such as "3af02bb0" with no prefix. Default
+ * to hex (not decimal) when no prefix is present, since a decimal address
+ * is never a legitimate input here and would otherwise make parsing silently
+ * fail on any unprefixed value containing the digits a-f. */
 fn str_to_usize(s: &str) -> Option<usize> {
     let radix;
     let start;
@@ -181,7 +190,7 @@ fn str_to_usize(s: &str) -> Option<usize> {
             start = s.get(2..);
         }
         _ => {
-            radix = 10;
+            radix = 16;
             start = Some(s);
         }
     }
@@ -209,6 +218,7 @@ fn init_serial_port(dtb: &dtb::Dtb) -> Result<(), usize> {
     let Some((pl011_base, pl011_range)) = dtb.read_reg_property(&pl011, 0) else {
         return Err(6);
     };
+    let pl011_base = dtb.translate_soc_address(pl011_base);
 
     let interrupts =
         dtb.read_property_as_u32_array(&dtb.get_property(&pl011, b"interrupts").unwrap());
@@ -327,6 +337,7 @@ fn find_gic_node(dtb: &dtb::Dtb) -> dtb::DtbNode {
 fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv2::GicDistributor {
     let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 0).unwrap();
+    let base_address = dtb.translate_soc_address(base_address);
     println!("GIC Distributor's Base Address: {:#X}", base_address);
     let gic_distributor = gicv2::GicDistributor::new(base_address, size).unwrap();
     gic_distributor.init();
@@ -336,6 +347,7 @@ fn init_gic_distributor(dtb: &dtb::Dtb) -> gicv2::GicDistributor {
 fn init_gic_cpu_interface(dtb: &dtb::Dtb) -> gicv2::GicCpuInterface {
     let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 1).unwrap();
+    let base_address = dtb.translate_soc_address(base_address);
     if size < gicv2::GicCpuInterface::GICC_MMIO_SIZE {
         panic!("Invalid GICC Size: {:#X}", size);
     }
@@ -348,6 +360,7 @@ fn init_gic_cpu_interface(dtb: &dtb::Dtb) -> gicv2::GicCpuInterface {
 fn init_gic_hypervisor_interface(dtb: &dtb::Dtb) -> gicv2::GicHypervisorInterface {
     let gic_node = find_gic_node(dtb);
     let (base_address, size) = dtb.read_reg_property(&gic_node, 2).unwrap();
+    let base_address = dtb.translate_soc_address(base_address);
     if size < gicv2::GicHypervisorInterface::GICH_MMIO_SIZE {
         panic!("Invalid GICH Size: {:#X}", size);
     }
@@ -359,7 +372,8 @@ fn init_gic_hypervisor_interface(dtb: &dtb::Dtb) -> gicv2::GicHypervisorInterfac
 /// (Used to map it via Stage 2 passthrough to the address corresponding to the guest's GICC)
 fn get_gic_virtual_cpu_interface(dtb: &dtb::Dtb) -> (usize, usize) {
     let gic_node = find_gic_node(dtb);
-    dtb.read_reg_property(&gic_node, 3).unwrap()
+    let (base_address, size) = dtb.read_reg_property(&gic_node, 3).unwrap();
+    (dtb.translate_soc_address(base_address), size)
 }
 
 fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv2::GicDistributor) {
@@ -413,6 +427,7 @@ fn init_sdhci(dtb: &dtb::Dtb) -> Option<drivers::sdhci::Sdhci> {
                     if dtb.is_node_operational(sdhci_node)
                         && let Some((base_address, _)) = dtb.read_reg_property(sdhci_node, 0)
                     {
+                        let base_address = dtb.translate_soc_address(base_address);
                         match drivers::sdhci::Sdhci::new(base_address) {
                             Ok(sdhci) => return Some(sdhci),
                             Err(()) => println!("Failed to initialize the SDHCI controller."),

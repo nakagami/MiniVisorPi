@@ -9,5 +9,11 @@ runner="tools/run_qemu.sh"
 # bin-pi4/disk/mini.elf instead of launching QEMU. It is implemented as a
 # `cargo run` alias (with the runner overridden) because cargo only invokes
 # a target's runner on `cargo run`/`cargo test`, never on plain `cargo build`.
+# It also overrides the linker script to scripts/pi4.ld: real Raspberry Pi 4
+# hardware's usable low RAM bank ends well before QEMU's 0x40400000 link
+# address (see scripts/pi4.ld), so Pi4 needs its own RAM_BASE.
+# `target.<triple>.rustflags` takes precedence over (and is NOT merged
+# with) the `[build] rustflags` in this file, so this cleanly replaces the
+# QEMU linker script rather than passing both -T flags to the linker.
 [alias]
-build-pi4 = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner=\"tools-pi4/copy_minivisor.sh\""]
+build-pi4 = ["run", "--config", "target.aarch64-unknown-none-softfloat.runner=\"tools-pi4/copy_minivisor.sh\"", "--config", "target.aarch64-unknown-none-softfloat.rustflags=[\"-C\", \"link-arg=-Tscripts/pi4.ld\"]"]

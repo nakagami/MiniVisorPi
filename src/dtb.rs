@@ -47,6 +47,7 @@ impl Dtb {
     const PROP_STATUS_OKAY: [u8; 5] = *b"okay\0";
     const PROP_COMPATIBLE: [u8; 10] = *b"compatible";
     pub const PROP_INTERRUPTS: [u8; 10] = *b"interrupts";
+    const PROP_RANGES: [u8; 6] = *b"ranges";
 
     const DEFAULT_ADDRESS_CELLS: u32 = 2;
     const DEFAULT_SIZE_CELLS: u32 = 1;
@@ -544,5 +545,68 @@ impl Dtb {
         } else {
             Some(unsafe { *(info.address as *const u32) })
         }
+    }
+
+    /// Translates a peripheral's bus-local "reg" address into the address
+    /// the CPU must actually use to access it, by applying the "ranges"
+    /// property of the DTB's "/soc" node (if any).
+    ///
+    /// On real hardware such as the Raspberry Pi 4, most peripherals (UART,
+    /// GIC, SDHCI/EMMC2, ...) live behind a "/soc" simple-bus whose "reg"
+    /// values (e.g. 0x7e201000 for the PL011 UART) are expressed in a
+    /// SoC-local bus address space, and must be remapped through "/soc"'s
+    /// "ranges" property (e.g. to CPU physical address 0xfe201000) before
+    /// they can be dereferenced. QEMU's `virt` machine has no such "/soc"
+    /// indirection (its devices are mapped directly at the address in
+    /// "reg"), so this is a no-op there.
+    pub fn translate_soc_address(&self, addr: usize) -> usize {
+        let Some(soc) = self.search_node(b"soc", None) else {
+            return addr;
+        };
+        let Some(ranges) = self.get_property(&soc, &Self::PROP_RANGES) else {
+            return addr;
+        };
+        // "child_cells"/"size_cells" below must be "/soc"'s OWN #address-cells/
+        // #size-cells (i.e. the cells used to address ITS children, such as
+        // "uart0"), NOT `soc.address_cells`/`soc.size_cells`, which instead
+        // hold the cells inherited from "/soc"'s PARENT (the root node) --
+        // those are exactly what's needed for the "ranges" property's parent-
+        // address field ("parent_cells" below), since "reg"/"ranges" parent
+        // addresses on a node are always interpreted using the parent bus's
+        // #address-cells (see read_reg_property(), which does the same for a
+        // node's own "reg" using `node.address_cells`).
+        let child_cells = self
+            .get_property(&soc, &Self::PROP_ADDRESS_CELLS)
+            .and_then(|p| self.read_property_as_u32(&p))
+            .unwrap_or(Self::DEFAULT_ADDRESS_CELLS) as usize;
+        let parent_cells = soc.address_cells as usize;
+        let size_cells = self
+            .get_property(&soc, &Self::PROP_SIZE_CELLS)
+            .and_then(|p| self.read_property_as_u32(&p))
+            .unwrap_or(Self::DEFAULT_SIZE_CELLS) as usize;
+        let entry_cells = child_cells + parent_cells + size_cells;
+        if entry_cells == 0 {
+            return addr;
+        }
+        let entry_bytes = entry_cells * 4;
+        let read_cells = |base: usize, cells: usize| -> usize {
+            let mut value: usize = 0;
+            for i in 0..(cells * 4) {
+                value <<= 8;
+                value |= unsafe { *((ranges.address + base + i) as *const u8) } as usize;
+            }
+            value
+        };
+        let mut offset = 0usize;
+        while offset + entry_bytes <= ranges.len as usize {
+            let child_base = read_cells(offset, child_cells);
+            let parent_base = read_cells(offset + child_cells * 4, parent_cells);
+            let range_size = read_cells(offset + (child_cells + parent_cells) * 4, size_cells);
+            if addr >= child_base && addr < child_base + range_size {
+                return parent_base + (addr - child_base);
+            }
+            offset += entry_bytes;
+        }
+        addr
     }
 }
