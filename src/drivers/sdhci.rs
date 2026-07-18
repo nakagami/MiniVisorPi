@@ -15,6 +15,8 @@
 //! drivers can implement the shared [`crate::drivers::block_device::BlockDevice`]
 //! trait and be used interchangeably by the FAT32 layer.
 
+use crate::asm;
+use core::cell::Cell;
 use core::ptr::{read_volatile, write_volatile};
 
 /* Register offsets (SDHCI v3.00) */
@@ -31,6 +33,11 @@ const SDHCI_CLOCK_CONTROL: usize = 0x2C;
 const SDHCI_TIMEOUT_CONTROL: usize = 0x2E;
 const SDHCI_SOFTWARE_RESET: usize = 0x2F;
 const SDHCI_INT_STATUS: usize = 0x30;
+/// Error Interrupt Status: only meaningful (and only worth reading) when
+/// SDHCI_INT_STATUS's bit 15 (SDHCI_INT_ERROR) is set; breaks a raised
+/// "Error Interrupt" down into its specific cause (command timeout, CRC,
+/// index mismatch, data timeout, ...) for diagnostics.
+const SDHCI_ERR_INT_STATUS: usize = 0x32;
 const SDHCI_INT_ENABLE: usize = 0x34;
 const SDHCI_SIGNAL_ENABLE: usize = 0x38;
 const SDHCI_HOST_CONTROL2: usize = 0x3E;
@@ -74,6 +81,22 @@ const SDHCI_CMD_RESP_48_BUSY: u16 = 0b11;
 const SDHCI_CMD_CRC_CHECK: u16 = 1 << 3;
 const SDHCI_CMD_INDEX_CHECK: u16 = 1 << 4;
 const SDHCI_CMD_DATA_PRESENT: u16 = 1 << 5;
+
+/// Minimum gap enforced between successive register writes (other than to
+/// SDHCI_BUFFER), matching u-boot's `bcm2835_sdhci.c` /
+/// `bcm2835_sdhci_raw_writel()` workaround: "The Arasan [derivative used by
+/// both BCM2835's legacy SD host and BCM2711's EMMC2] has a bugette whereby
+/// it may lose the content of successive writes to registers that are
+/// within two SD-card clock cycles of each other (a clock domain crossing
+/// problem)." Without this delay, the CPU (running at GHz speed) can issue
+/// several register writes for one command (INT_STATUS clear, ARGUMENT,
+/// COMMAND, ...) far faster than 2 SD clock cycles, silently dropping some
+/// of them -- typically manifesting as a command that appears to have been
+/// issued (SDHCI_CMD_INHIBIT sets) but never gets a response/interrupt.
+/// Sized against the slowest (400KHz, card identification) clock speed used
+/// during setup, like u-boot's driver, since that yields the largest -- and
+/// therefore always-sufficient -- required delay.
+const REGISTER_WRITE_SPACING_US: u64 = (2 * 1_000_000) / 400_000 + 1;
 
 /// SD block size used for every transfer.
 const BLOCK_SIZE: usize = 512;
@@ -127,6 +150,11 @@ pub struct Sdhci {
     /// block index) or byte (SDSC, `block_address` is a byte offset that
     /// must be converted to a block index) addressing.
     is_high_capacity: bool,
+    /// CNTPCT_EL0 timestamp (in ticks) of the last non-SDHCI_BUFFER register
+    /// write, used to enforce REGISTER_WRITE_SPACING_US. A `Cell` since the
+    /// register accessors take `&self` (mirroring pl011::Pl011's shared-
+    /// reference style) even though they mutate hardware/timing state.
+    last_write_ticks: Cell<u64>,
 }
 
 impl Sdhci {
@@ -135,6 +163,7 @@ impl Sdhci {
             base_address: 0,
             rca: 0,
             is_high_capacity: false,
+            last_write_ticks: Cell::new(0),
         }
     }
 
@@ -143,6 +172,7 @@ impl Sdhci {
             base_address,
             rca: 0,
             is_high_capacity: false,
+            last_write_ticks: Cell::new(0),
         };
         sdhci.reset_all()?;
 
@@ -176,12 +206,35 @@ impl Sdhci {
 
     /* ---- Low level register access ---- */
 
+    /// Busy-waits (if needed) so that at least REGISTER_WRITE_SPACING_US has
+    /// elapsed since the previous register write, then records the new
+    /// timestamp. Must be called before every register write except to
+    /// SDHCI_BUFFER (see REGISTER_WRITE_SPACING_US).
+    fn wait_for_write_spacing(&self) {
+        let frequency = asm::get_cntfrq_el0();
+        if frequency == 0 {
+            return;
+        }
+        let spacing_ticks = (REGISTER_WRITE_SPACING_US * frequency).div_ceil(1_000_000);
+        loop {
+            let now = asm::get_cntpct_el0();
+            if now.wrapping_sub(self.last_write_ticks.get()) >= spacing_ticks {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
     fn read32(&self, offset: usize) -> u32 {
         unsafe { read_volatile((self.base_address + offset) as *const u32) }
     }
 
     fn write32(&self, offset: usize, value: u32) {
-        unsafe { write_volatile((self.base_address + offset) as *mut u32, value) }
+        if offset != SDHCI_BUFFER {
+            self.wait_for_write_spacing();
+        }
+        unsafe { write_volatile((self.base_address + offset) as *mut u32, value) };
+        self.last_write_ticks.set(asm::get_cntpct_el0());
     }
 
     fn read16(&self, offset: usize) -> u16 {
@@ -189,11 +242,19 @@ impl Sdhci {
     }
 
     fn write16(&self, offset: usize, value: u16) {
-        unsafe { write_volatile((self.base_address + offset) as *mut u16, value) }
+        if offset != SDHCI_BUFFER {
+            self.wait_for_write_spacing();
+        }
+        unsafe { write_volatile((self.base_address + offset) as *mut u16, value) };
+        self.last_write_ticks.set(asm::get_cntpct_el0());
     }
 
     fn write8(&self, offset: usize, value: u8) {
-        unsafe { write_volatile((self.base_address + offset) as *mut u8, value) }
+        if offset != SDHCI_BUFFER {
+            self.wait_for_write_spacing();
+        }
+        unsafe { write_volatile((self.base_address + offset) as *mut u8, value) };
+        self.last_write_ticks.set(asm::get_cntpct_el0());
     }
 
     fn read_present_state(&self) -> u32 {
@@ -281,7 +342,11 @@ impl Sdhci {
             let status = self.read16(SDHCI_INT_STATUS);
             if (status & SDHCI_INT_ERROR) != 0 {
                 /* W1C: acknowledge every raised status bit. */
+                let err_status = self.read16(SDHCI_ERR_INT_STATUS);
                 self.write16(SDHCI_INT_STATUS, status);
+                println!(
+                    "SDHCI: error interrupt (INT_STATUS={status:#06X}, ERR_INT_STATUS={err_status:#06X})"
+                );
                 return Err(());
             }
             if (status & mask) != 0 {
@@ -290,6 +355,11 @@ impl Sdhci {
             }
             core::hint::spin_loop();
         }
+        println!(
+            "SDHCI: no interrupt within timeout (last INT_STATUS={:#06X}, PRESENT_STATE={:#010X})",
+            self.read16(SDHCI_INT_STATUS),
+            self.read_present_state()
+        );
         Err(())
     }
 

@@ -39,6 +39,24 @@ pub fn get_stack_pointer() -> u64 {
     sp
 }
 
+/// Reads the EL2 physical generic timer's free-running counter
+/// (`CNTPCT_EL0`), ticking at `get_cntfrq_el0()` Hz. Used for short
+/// microsecond-scale busy-wait delays (e.g. drivers/sdhci.rs's
+/// back-to-back register write spacing workaround) rather than the
+/// interrupt-driven virtual timer set up in drivers/generic_timer.rs.
+pub fn get_cntpct_el0() -> u64 {
+    let cntpct_el0: u64;
+    unsafe { asm!("mrs {}, cntpct_el0", out(reg) cntpct_el0) };
+    cntpct_el0
+}
+
+/// Reads the generic timer's counter frequency (Hz), as fixed by firmware.
+pub fn get_cntfrq_el0() -> u64 {
+    let cntfrq_el0: u64;
+    unsafe { asm!("mrs {}, cntfrq_el0", out(reg) cntfrq_el0) };
+    cntfrq_el0
+}
+
 pub fn get_id_aa64mmfr0_el1() -> u64 {
     let id_aa64mmfr0_el1: u64;
     unsafe { asm!("mrs {}, id_aa64mmfr0_el1", out(reg) id_aa64mmfr0_el1) };
