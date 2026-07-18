@@ -543,7 +543,12 @@ impl Dtb {
         if (info.len as usize) < size_of::<u32>() {
             None
         } else {
-            Some(unsafe { *(info.address as *const u32) })
+            // DTB property values are always stored big-endian; convert to
+            // native (like check_address_and_size_cells() does for the same
+            // "#address-cells"/"#size-cells" properties read via the
+            // node-search path), otherwise every caller sees a byte-swapped
+            // value (e.g. #address-cells = <1> misread as 0x01000000).
+            Some(u32::from_be(unsafe { *(info.address as *const u32) }))
         }
     }
 
