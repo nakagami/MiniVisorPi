@@ -10,12 +10,18 @@ pub struct Pl011 {
     base_address: usize,
 }
 
-const UART_SIZE: usize = 0x1000;
-
 const UART_DR: usize = 0x000;
 const UART_FR: usize = 0x018;
 const UART_CR: usize = 0x030;
 const UART_IMSC: usize = 0x038;
+/// Minimum MMIO range this driver actually touches: the highest register it
+/// accesses is UART_IMSC, read/written as a u16, so this is UART_IMSC + 2.
+/// This must NOT simply be the PL011's whole 4 KiB page size (as QEMU's
+/// `virt` machine reports for its pl011@9000000 node): the Raspberry Pi 4's
+/// official devicetree instead gives its PL011 a much tighter "reg" range
+/// (0x200 bytes), which is still ample for every register this driver uses,
+/// so requiring a full page here would wrongly reject valid real hardware.
+const UART_SIZE: usize = UART_IMSC + 2;
 
 /// Bit indicating whether the TX FIFO is full
 const UART_FR_TXFF: u16 = 1 << 5;
