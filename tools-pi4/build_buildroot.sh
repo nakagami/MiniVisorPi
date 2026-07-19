@@ -28,6 +28,15 @@ fi
 # qemu_aarch64_virt_defconfig used for the QEMU environment in
 # tools/build_buildroot.sh.
 make raspberrypi4_64_defconfig
+
+# raspberrypi4_64_defconfig's kernel config has no virtio support (real Pi4
+# hardware has no virtio bus), but this kernel actually runs as MiniVisorPi's
+# guest, which always exposes storage/network via virtio-mmio (see
+# scripts/virt.dts). Merge in the virtio options so the guest kernel can
+# find /dev/vda; without this it panics at root-mount time.
+./utils/config --set-str BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES "$BASE_DIR/tools-pi4/linux-virtio.fragment"
+make olddefconfig
+
 make -j$(nproc) || exit $?
 
 cp output/images/Image $DISK_IMG_DIR/Image

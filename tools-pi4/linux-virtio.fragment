@@ -1,0 +1,13 @@
+# Real Raspberry Pi 4 hardware has no virtio bus of its own, so the
+# stock raspberrypi4_64_defconfig kernel config (BR2_LINUX_KERNEL_DEFCONFIG
+# "bcm2711" in tools-pi4/build_buildroot.sh) does not enable any virtio
+# drivers. However, this kernel is not booted directly on the hardware: it
+# is booted as MiniVisorPi's *guest* (see scripts/virt.dts), which always
+# exposes storage/network to the guest as virtio-mmio devices regardless of
+# the host platform. Without these options the guest kernel cannot find
+# /dev/vda and panics with "VFS: Unable to mount root fs on unknown-block(0,0)".
+CONFIG_VIRTIO_MENU=y
+CONFIG_VIRTIO_MMIO=y
+CONFIG_VIRTIO_MMIO_CMDLINE_DEVICES=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y

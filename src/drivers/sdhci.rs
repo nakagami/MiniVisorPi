@@ -389,11 +389,8 @@ impl Sdhci {
     /* ---- Command layer ---- */
 
     fn wait_for_not_inhibited(&self, mask: u32) -> Result<(), ()> {
-        for i in 0..POLL_TIMEOUT {
+        for _ in 0..POLL_TIMEOUT {
             if (self.read_present_state() & mask) == 0 {
-                if i > 100 {
-                    println!("SDHCI: wait_for_not_inhibited took {i} iterations (mask={mask:#010X})");
-                }
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -463,17 +460,6 @@ impl Sdhci {
             command |= SDHCI_CMD_DATA_PRESENT;
         }
         self.write16(SDHCI_COMMAND, command);
-        if index == CMD_APP_CMD {
-            let host_ctrl_word = self.read32(SDHCI_POWER_CONTROL & !0b11);
-            let power_control = (host_ctrl_word >> 8) as u8;
-            println!(
-                "SDHCI: issued CMD{index} command={command:#06X} present_state_after_write={:#010X} clock_control={:#06X} power_control={power_control:#04X} host_control2={:#06X} int_enable={:#06X}",
-                self.read_present_state(),
-                self.read16(SDHCI_CLOCK_CONTROL),
-                self.read16(SDHCI_HOST_CONTROL2),
-                self.read16(SDHCI_INT_ENABLE)
-            );
-        }
 
         self.wait_for_interrupt(SDHCI_INT_RESPONSE)
             .map_err(|_| println!("SDHCI: CMD{index} timed out or failed"))?;
@@ -521,32 +507,25 @@ impl Sdhci {
         /* CMD8: SEND_IF_COND - probes for a v2.00+ card and picks the
          * 2.7-3.6V voltage range. Older (v1) cards do not respond to this
          * command; treat a failure as "legacy card" rather than an error. */
-        let cmd8_result = self.send_command(
-            CMD_SEND_IF_COND,
-            CMD8_VOLTAGE_CHECK_PATTERN,
-            ResponseType::R48,
-            false,
-        );
-        println!(
-            "SDHCI: CMD8 result={:?} present_state={:#010X}",
-            cmd8_result.as_ref().map(|r| r[0]),
-            self.read_present_state()
-        );
-        let is_v2_or_later = cmd8_result.is_ok();
+        let is_v2_or_later = self
+            .send_command(
+                CMD_SEND_IF_COND,
+                CMD8_VOLTAGE_CHECK_PATTERN,
+                ResponseType::R48,
+                false,
+            )
+            .is_ok();
 
         /* ACMD41: SD_SEND_OP_COND - poll until the card leaves the busy
          * state, requesting High Capacity Support so SDHC/SDXC cards report
          * block instead of byte addressing. */
         let mut ocr = 0;
         let mut ready = false;
-        for i in 0..ACMD41_RETRIES {
+        for _ in 0..ACMD41_RETRIES {
             let argument = ACMD41_VOLTAGE_WINDOW | if is_v2_or_later { ACMD41_HCS } else { 0 };
             let response =
                 self.app_command(ACMD_SD_SEND_OP_COND, argument, ResponseType::R48NoCrc)?;
             ocr = response[0];
-            if i < 3 {
-                println!("SDHCI: ACMD41 iter={i} ocr={ocr:#010X}");
-            }
             if (ocr & OCR_BUSY) != 0 {
                 ready = true;
                 break;
