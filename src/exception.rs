@@ -251,10 +251,24 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
     let ec = esr_el2 & ESR_EL2_EC;
     match ec {
         ESR_EL2_EC_DATA_ABORT => data_abort_handler(unsafe { &mut *registers }, esr_el2),
+        ESR_EL2_EC_WFX => wfx_handler(),
         _ => {
             panic!("Unknown Exception: {}", ec >> ESR_EL2_EC_BITS_OFFSET);
         }
     }
+}
+
+/// Handles a guest WFI/WFE trapped to EL2 via HCR_EL2.TWI. Since the physical PL011
+/// RX interrupt never reaches this Non-secure EL2 hypervisor on real Raspberry Pi 4
+/// hardware (SPI 153 stays GIC Group 0; neither fiq_handler nor irq_handler ever runs
+/// for it), the guest can only learn about keystrokes if we poll the physical UART
+/// ourselves. A guest idling at a prompt sits in WFI, so this trap is a reliable
+/// polling point: drain the physical RX FIFO and inject any bytes into the guest's
+/// virtual PL011, then advance past the WFI so the guest re-evaluates its wait
+/// condition (and picks up the freshly injected input interrupt).
+fn wfx_handler() {
+    crate::handle_input(&crate::PL011_DEVICE);
+    unsafe { asm::advance_elr_el2() };
 }
 
 /// Handles a physical FIQ, i.e. a Group 0 (Secure) interrupt. On real hardware, an SPI

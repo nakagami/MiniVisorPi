@@ -5,6 +5,14 @@
 /* HCR_EL2 */
 pub const HCR_EL2_API: u64 = 1 << 41;
 pub const HCR_EL2_RW: u64 = 1 << 31;
+/// Trap guest (EL1/EL0) WFI to EL2. On real Raspberry Pi 4 hardware the physical
+/// PL011 RX interrupt (SPI 153) stays in GIC Group 0 and is never delivered to the
+/// Non-secure EL2 hypervisor (confirmed: neither fiq_handler nor irq_handler ever
+/// runs for it), so interrupt-driven console input is impossible. Trapping WFI gives
+/// a reliable hook to poll the physical UART: while the guest idles at a prompt it
+/// executes WFI, which traps here, letting us drain the physical RX FIFO and inject
+/// any keystrokes into the guest's virtual PL011 before resuming.
+pub const HCR_EL2_TWI: u64 = 1 << 13;
 pub const HCR_EL2_AMO: u64 = 1 << 5;
 pub const HCR_EL2_IMO: u64 = 1 << 4;
 pub const HCR_EL2_FMO: u64 = 1 << 3;
@@ -35,6 +43,9 @@ pub const ID_AA64MMFR0_EL1_PARANGE: u64 = 0b1111;
 pub const ESR_EL2_EC_BITS_OFFSET: u64 = 26;
 pub const ESR_EL2_EC: u64 = 0b111111 << ESR_EL2_EC_BITS_OFFSET;
 pub const ESR_EL2_EC_DATA_ABORT: u64 = 0b100100 << 26;
+/// EC value for a trapped WFI/WFE instruction (Arm ARM: "Trapped WFI or WFE"). Used
+/// with HCR_EL2.TWI so guest WFI becomes a UART-polling hook (see HCR_EL2_TWI).
+pub const ESR_EL2_EC_WFX: u64 = 0b000001 << 26;
 pub const ESR_EL2_ISS_ISV: u64 = 1 << 24;
 pub const ESR_EL2_ISS_SAS_BITS_OFFSET: u64 = 22;
 pub const ESR_EL2_ISS_SAS: u64 = 0b11 << ESR_EL2_ISS_SAS_BITS_OFFSET;

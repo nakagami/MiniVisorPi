@@ -215,21 +215,8 @@ pub fn create_vm(
     let disk_file = fat32
         .search_file(core::str::from_utf8(&file_name).unwrap())
         .expect("Failed to find Disk");
-    /* Diagnostic: on real Raspberry Pi 4 hardware, virtio_blk in the guest has
-     * sometimes reported a 0-block capacity despite the disk image file being
-     * loaded successfully (and listed with the correct size by
-     * Fat32::list_files() moments earlier). Print the size captured here to
-     * determine whether search_file() itself already returns 0, or whether
-     * the FileInfo/VirtioBlkMmio is corrupted sometime after this point. */
-    println!(
-        "DISK{vm_id} file size at VM creation: {:#X}",
-        disk_file.get_file_size()
-    );
-    mmio_handlers.push_back(MmioEntry::new(
-        0xa000000,
-        0x0200,
-        Arc::new(Mutex::new(VirtioBlkMmio::new(disk_file))),
-    ));
+    let virtio_blk_mmio = Arc::new(Mutex::new(VirtioBlkMmio::new(disk_file)));
+    mmio_handlers.push_back(MmioEntry::new(0xa000000, 0x0200, virtio_blk_mmio));
 
     /* GIC Distributor(Virtual) */
     let gic_distributor_mmio = Arc::new(Mutex::new(GicDistributorMmio::new(
@@ -324,7 +311,13 @@ fn setup_hypervisor_registers() {
     unsafe { asm::set_vmpidr_el2(asm::get_mpidr_el1()) };
 
     /* HCR_EL2 */
-    let hcr_el2 = HCR_EL2_RW | HCR_EL2_API | HCR_EL2_AMO | HCR_EL2_IMO | HCR_EL2_FMO | HCR_EL2_VM;
+    let hcr_el2 = HCR_EL2_RW
+        | HCR_EL2_API
+        | HCR_EL2_AMO
+        | HCR_EL2_IMO
+        | HCR_EL2_FMO
+        | HCR_EL2_TWI
+        | HCR_EL2_VM;
     unsafe { asm::set_hcr_el2(hcr_el2) };
 }
 
