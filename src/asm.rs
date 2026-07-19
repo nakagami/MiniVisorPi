@@ -140,6 +140,42 @@ pub unsafe fn invalidate_cache(address: usize) {
     unsafe { asm!("dc ivac, {}", in(reg) address) };
 }
 
+/// Clean the D-cache to the point of unification and invalidate the
+/// I-cache for `[address, address + size)`.
+///
+/// This must be called after writing executable code (e.g. a guest kernel
+/// image) into memory via normal cached stores and before that code is
+/// executed, since a CPU with real (non-modeled) caches is not guaranteed
+/// to observe the freshly written bytes through the instruction fetch path
+/// otherwise. Without this, the guest may fetch stale/garbage instructions
+/// on real hardware even though the same code works under QEMU (which does
+/// not model cache incoherency).
+pub unsafe fn clean_dcache_and_invalidate_icache(address: usize, size: usize) {
+    let ctr_el0: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
+    let dcache_line_size: usize = 4usize << ((ctr_el0 >> 16) & 0xF);
+    let icache_line_size: usize = 4usize << (ctr_el0 & 0xF);
+
+    let end = address + size;
+
+    /* Clean each D-cache line covering the range to the point of unification. */
+    let mut addr = address & !(dcache_line_size - 1);
+    while addr < end {
+        unsafe { asm!("dc cvau, {}", in(reg) addr) };
+        addr += dcache_line_size;
+    }
+    unsafe { asm!("dsb ish") };
+
+    /* Invalidate each I-cache line covering the range to the point of unification. */
+    let mut addr = address & !(icache_line_size - 1);
+    while addr < end {
+        unsafe { asm!("ic ivau, {}", in(reg) addr) };
+        addr += icache_line_size;
+    }
+    unsafe { asm!("dsb ish") };
+    unsafe { asm!("isb") };
+}
+
 pub fn get_midr_el1() -> u64 {
     let midr_el1: u64;
     unsafe { asm!("mrs {}, midr_el1", out(reg) midr_el1) };

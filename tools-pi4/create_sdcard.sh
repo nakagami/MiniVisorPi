@@ -25,6 +25,7 @@ if [ ! -f $DISK_IMG_DIR/bcm2711-rpi-4-b.dtb ]; then
 fi
 
 tools-pi4/create_boot_scr.sh
+dtc -I dts -O dtb -o $DISK_IMG_DIR/DTB scripts/virt.dts
 
 cat > $DISK_IMG_DIR/config.txt <<'EOF'
 # Raspberry Pi 4 boot configuration for MiniVisor

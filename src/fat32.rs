@@ -51,7 +51,9 @@ struct DirectoryEntry {
 
 impl Fat32 {
     pub fn new(blk: &mut dyn BlockDevice, base_lba: usize, lba_size: usize) -> Result<Fat32, ()> {
-        let mut bpb_buffer: [u8; 512] = [0; 512];
+        #[repr(align(4))]
+        struct AlignedBuffer([u8; 512]);
+        let mut bpb_buffer = AlignedBuffer([0; 512]);
         let bpb_address = &mut bpb_buffer as *mut _ as usize;
         blk.read(bpb_address, (base_lba * lba_size) as u64, 512)?;
 
@@ -61,15 +63,23 @@ impl Fat32 {
             return Err(());
         }
 
-        /* Read the BPB */
-        let bytes_per_sector = unsafe { *((bpb_address + BYTES_PER_SECTOR_OFFSET) as *const u16) };
+        /* Read the BPB. These offsets are not necessarily aligned to the
+         * size of the field being read (BYTES_PER_SECTOR_OFFSET=11 is
+         * odd, for instance), so use read_unaligned rather than a direct
+         * pointer dereference. */
+        let bytes_per_sector =
+            unsafe { core::ptr::read_unaligned((bpb_address + BYTES_PER_SECTOR_OFFSET) as *const u16) };
         let sectors_per_cluster =
-            unsafe { *((bpb_address + SECTORS_PER_CLUSTER_OFFSET) as *const u8) };
-        let reserved_sectors =
-            unsafe { *((bpb_address + NUM_OF_RESERVED_CLUSTER_OFFSET) as *const u16) };
-        let number_of_fats = unsafe { *((bpb_address + NUM_OF_FATS_OFFSET) as *const u16) };
-        let fat_sectors = unsafe { *((bpb_address + FAT_SIZE_OFFSET) as *const u32) };
-        let root_cluster = unsafe { *((bpb_address + ROOT_CLUSTER_OFFSET) as *const u32) };
+            unsafe { core::ptr::read_unaligned((bpb_address + SECTORS_PER_CLUSTER_OFFSET) as *const u8) };
+        let reserved_sectors = unsafe {
+            core::ptr::read_unaligned((bpb_address + NUM_OF_RESERVED_CLUSTER_OFFSET) as *const u16)
+        };
+        let number_of_fats =
+            unsafe { core::ptr::read_unaligned((bpb_address + NUM_OF_FATS_OFFSET) as *const u16) };
+        let fat_sectors =
+            unsafe { core::ptr::read_unaligned((bpb_address + FAT_SIZE_OFFSET) as *const u32) };
+        let root_cluster =
+            unsafe { core::ptr::read_unaligned((bpb_address + ROOT_CLUSTER_OFFSET) as *const u32) };
 
         /* Read the FAT */
         let fat_size = (fat_sectors as usize) * (bytes_per_sector as usize);

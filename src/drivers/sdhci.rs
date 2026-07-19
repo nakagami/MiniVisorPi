@@ -136,7 +136,13 @@ const OCR_BUSY: u32 = 1 << 31;
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum ResponseType {
     None,
+    /// 48-bit response with CRC and command-index checking (R1/R6/R7).
     R48,
+    /// 48-bit response WITHOUT CRC or command-index checking (R3/OCR).
+    /// The OCR response carries an all-ones CRC field and an all-ones
+    /// command-index field, so enabling those checks makes the controller
+    /// flag a spurious error and wedge its command state machine.
+    R48NoCrc,
     R48Busy,
     R136,
 }
@@ -155,6 +161,13 @@ pub struct Sdhci {
     /// register accessors take `&self` (mirroring pl011::Pl011's shared-
     /// reference style) even though they mutate hardware/timing state.
     last_write_ticks: Cell<u64>,
+    /// Cached value last written to SDHCI_TRANSFER_MODE (0x0C), which
+    /// shares a 32-bit hardware word with SDHCI_COMMAND (0x0E). Mirrors
+    /// u-boot's `bcm2835_sdhci_writew()`: on this controller a bare 16-bit
+    /// store to SDHCI_COMMAND alone is not reliable, so writes to
+    /// TRANSFER_MODE are only cached here and the two halves are combined
+    /// into a single 32-bit write once COMMAND is written (see write16()).
+    transfer_mode_shadow: Cell<u16>,
 }
 
 impl Sdhci {
@@ -164,6 +177,7 @@ impl Sdhci {
             rca: 0,
             is_high_capacity: false,
             last_write_ticks: Cell::new(0),
+            transfer_mode_shadow: Cell::new(0),
         }
     }
 
@@ -173,6 +187,7 @@ impl Sdhci {
             rca: 0,
             is_high_capacity: false,
             last_write_ticks: Cell::new(0),
+            transfer_mode_shadow: Cell::new(0),
         };
         sdhci.reset_all()?;
 
@@ -183,8 +198,10 @@ impl Sdhci {
             println!("SDHCI: card-detect line reports no card inserted");
         }
 
-        /* Enable the bus power supply at the highest voltage the
-         * controller advertises support for (typically 3.3V). */
+        /* Enable the bus power supply at 3.3V. Per the SDHCI spec the
+         * SD Bus Voltage Select field (POWER_CONTROL[3:1]) is
+         * 111b=3.3V, 110b=3.0V, 101b=1.8V (matches u-boot's
+         * SDHCI_POWER_330 = 0x0E, i.e. bits[3:1]=111). */
         sdhci.set_power(0b111);
 
         /* Bring the clock up to the card identification frequency
@@ -229,36 +246,80 @@ impl Sdhci {
         unsafe { read_volatile((self.base_address + offset) as *const u32) }
     }
 
-    fn write32(&self, offset: usize, value: u32) {
-        if offset != SDHCI_BUFFER {
+    /// Performs the actual 32-bit-aligned write, honoring the write-spacing
+    /// workaround. All register writes ultimately go through this: real
+    /// BCM2711 EMMC2/Arasan hardware does not reliably accept narrower
+    /// (8/16-bit) bus-level stores (see write16()/write8()), so every
+    /// write, even one nominally narrower, is issued as a full 32-bit
+    /// store to a 4-byte-aligned offset.
+    fn raw_write32(&self, aligned_offset: usize, value: u32) {
+        if aligned_offset != SDHCI_BUFFER {
             self.wait_for_write_spacing();
         }
-        unsafe { write_volatile((self.base_address + offset) as *mut u32, value) };
+        unsafe { write_volatile((self.base_address + aligned_offset) as *mut u32, value) };
         self.last_write_ticks.set(asm::get_cntpct_el0());
+    }
+
+    fn write32(&self, offset: usize, value: u32) {
+        self.raw_write32(offset, value);
     }
 
     fn read16(&self, offset: usize) -> u16 {
         unsafe { read_volatile((self.base_address + offset) as *const u16) }
     }
 
+    /// Writes a 16-bit register via a 32-bit read-modify-write, mirroring
+    /// u-boot's `bcm2835_sdhci_writew()`: BCM2711's Arasan-derived EMMC2
+    /// controller is documented there as unreliable with bare 16-bit
+    /// stores. SDHCI_TRANSFER_MODE (0x0C) and SDHCI_COMMAND (0x0E) share
+    /// one 32-bit word and, per that same driver, must be committed
+    /// together in a single write (issuing a command also always supplies
+    /// the transfer mode for it): writes to TRANSFER_MODE are therefore
+    /// only cached (`transfer_mode_shadow`), and applied to hardware only
+    /// once COMMAND is written.
     fn write16(&self, offset: usize, value: u16) {
-        if offset != SDHCI_BUFFER {
-            self.wait_for_write_spacing();
+        if offset == SDHCI_TRANSFER_MODE {
+            self.transfer_mode_shadow.set(value);
+            return;
         }
-        unsafe { write_volatile((self.base_address + offset) as *mut u16, value) };
-        self.last_write_ticks.set(asm::get_cntpct_el0());
+        let aligned_offset = offset & !0b11;
+        let word_shift = ((offset >> 1) & 1) * 16;
+        let old_value = if offset == SDHCI_COMMAND {
+            self.transfer_mode_shadow.get() as u32
+        } else {
+            self.read32(aligned_offset)
+        };
+        let mask: u32 = 0xFFFF << word_shift;
+        let new_value = (old_value & !mask) | ((value as u32) << word_shift);
+        self.raw_write32(aligned_offset, new_value);
     }
 
+    /// Writes an 8-bit register via a 32-bit read-modify-write; see
+    /// write16() for why this is required on this controller.
     fn write8(&self, offset: usize, value: u8) {
-        if offset != SDHCI_BUFFER {
-            self.wait_for_write_spacing();
-        }
-        unsafe { write_volatile((self.base_address + offset) as *mut u8, value) };
-        self.last_write_ticks.set(asm::get_cntpct_el0());
+        let aligned_offset = offset & !0b11;
+        let byte_shift = (offset & 0b11) * 8;
+        let old_value = self.read32(aligned_offset);
+        let mask: u32 = 0xFF << byte_shift;
+        let new_value = (old_value & !mask) | ((value as u32) << byte_shift);
+        self.raw_write32(aligned_offset, new_value);
     }
 
     fn read_present_state(&self) -> u32 {
         self.read32(SDHCI_PRESENT_STATE)
+    }
+
+    /// Busy-waits for at least `us` microseconds using the generic timer.
+    fn delay_us(&self, us: u64) {
+        let frequency = asm::get_cntfrq_el0();
+        if frequency == 0 {
+            return;
+        }
+        let ticks = (us * frequency).div_ceil(1_000_000);
+        let start = asm::get_cntpct_el0();
+        while asm::get_cntpct_el0().wrapping_sub(start) < ticks {
+            core::hint::spin_loop();
+        }
     }
 
     /* ---- Initialization helpers ---- */
@@ -328,8 +389,11 @@ impl Sdhci {
     /* ---- Command layer ---- */
 
     fn wait_for_not_inhibited(&self, mask: u32) -> Result<(), ()> {
-        for _ in 0..POLL_TIMEOUT {
+        for i in 0..POLL_TIMEOUT {
             if (self.read_present_state() & mask) == 0 {
+                if i > 100 {
+                    println!("SDHCI: wait_for_not_inhibited took {i} iterations (mask={mask:#010X})");
+                }
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -372,10 +436,15 @@ impl Sdhci {
         response_type: ResponseType,
         data_present: bool,
     ) -> Result<[u32; 4], ()> {
-        self.wait_for_not_inhibited(SDHCI_CMD_INHIBIT)?;
-        if data_present || response_type == ResponseType::R48Busy {
-            self.wait_for_not_inhibited(SDHCI_DAT_INHIBIT)?;
-        }
+        /* U-Boot's generic sdhci_send_command() waits for BOTH CMD_INHIBIT
+         * and DAT_INHIBIT to clear before issuing essentially every command
+         * (the only exceptions are STOP_TRANSMISSION and tuning-block
+         * commands without data, which we do not implement here). A card
+         * can be internally busy on the DAT lines after a response even
+         * when that response type has no defined "busy" signaling (e.g.
+         * ACMD41's R3), so unconditionally waiting on DAT_INHIBIT too
+         * avoids issuing the next command while the card is still busy. */
+        self.wait_for_not_inhibited(SDHCI_CMD_INHIBIT | SDHCI_DAT_INHIBIT)?;
 
         self.write16(SDHCI_INT_STATUS, 0xFFFF);
         self.write32(SDHCI_ARGUMENT, argument);
@@ -383,6 +452,7 @@ impl Sdhci {
         let response_select = match response_type {
             ResponseType::None => SDHCI_CMD_RESP_NONE,
             ResponseType::R48 => SDHCI_CMD_RESP_48 | SDHCI_CMD_CRC_CHECK | SDHCI_CMD_INDEX_CHECK,
+            ResponseType::R48NoCrc => SDHCI_CMD_RESP_48,
             ResponseType::R48Busy => {
                 SDHCI_CMD_RESP_48_BUSY | SDHCI_CMD_CRC_CHECK | SDHCI_CMD_INDEX_CHECK
             }
@@ -393,6 +463,17 @@ impl Sdhci {
             command |= SDHCI_CMD_DATA_PRESENT;
         }
         self.write16(SDHCI_COMMAND, command);
+        if index == CMD_APP_CMD {
+            let host_ctrl_word = self.read32(SDHCI_POWER_CONTROL & !0b11);
+            let power_control = (host_ctrl_word >> 8) as u8;
+            println!(
+                "SDHCI: issued CMD{index} command={command:#06X} present_state_after_write={:#010X} clock_control={:#06X} power_control={power_control:#04X} host_control2={:#06X} int_enable={:#06X}",
+                self.read_present_state(),
+                self.read16(SDHCI_CLOCK_CONTROL),
+                self.read16(SDHCI_HOST_CONTROL2),
+                self.read16(SDHCI_INT_ENABLE)
+            );
+        }
 
         self.wait_for_interrupt(SDHCI_INT_RESPONSE)
             .map_err(|_| println!("SDHCI: CMD{index} timed out or failed"))?;
@@ -428,6 +509,7 @@ impl Sdhci {
         response_type: ResponseType,
     ) -> Result<[u32; 4], ()> {
         /* CMD55 must carry the currently selected card's RCA. */
+        self.delay_us(1000);
         self.send_command(CMD_APP_CMD, self.rca << 16, ResponseType::R48, false)?;
         self.send_command(index, argument, response_type, false)
     }
@@ -439,24 +521,32 @@ impl Sdhci {
         /* CMD8: SEND_IF_COND - probes for a v2.00+ card and picks the
          * 2.7-3.6V voltage range. Older (v1) cards do not respond to this
          * command; treat a failure as "legacy card" rather than an error. */
-        let is_v2_or_later = self
-            .send_command(
-                CMD_SEND_IF_COND,
-                CMD8_VOLTAGE_CHECK_PATTERN,
-                ResponseType::R48,
-                false,
-            )
-            .is_ok();
+        let cmd8_result = self.send_command(
+            CMD_SEND_IF_COND,
+            CMD8_VOLTAGE_CHECK_PATTERN,
+            ResponseType::R48,
+            false,
+        );
+        println!(
+            "SDHCI: CMD8 result={:?} present_state={:#010X}",
+            cmd8_result.as_ref().map(|r| r[0]),
+            self.read_present_state()
+        );
+        let is_v2_or_later = cmd8_result.is_ok();
 
         /* ACMD41: SD_SEND_OP_COND - poll until the card leaves the busy
          * state, requesting High Capacity Support so SDHC/SDXC cards report
          * block instead of byte addressing. */
         let mut ocr = 0;
         let mut ready = false;
-        for _ in 0..ACMD41_RETRIES {
+        for i in 0..ACMD41_RETRIES {
             let argument = ACMD41_VOLTAGE_WINDOW | if is_v2_or_later { ACMD41_HCS } else { 0 };
-            let response = self.app_command(ACMD_SD_SEND_OP_COND, argument, ResponseType::R48)?;
+            let response =
+                self.app_command(ACMD_SD_SEND_OP_COND, argument, ResponseType::R48NoCrc)?;
             ocr = response[0];
+            if i < 3 {
+                println!("SDHCI: ACMD41 iter={i} ocr={ocr:#010X}");
+            }
             if (ocr & OCR_BUSY) != 0 {
                 ready = true;
                 break;

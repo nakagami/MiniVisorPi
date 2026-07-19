@@ -263,6 +263,16 @@ pub fn create_vm(
         .read(&kernel, blk, kernel_physical_address, 0, kernel_size)
         .expect("Failed to read Kernel");
 
+    /* Make the freshly loaded DTB and kernel image visible to the
+     * instruction fetch path. Without this, a CPU with real (non-modeled)
+     * caches may execute stale/garbage instructions instead of the code
+     * just written by the SDHCI/FAT32 read above (this is not observable
+     * under QEMU, which does not model cache incoherency). */
+    unsafe {
+        asm::clean_dcache_and_invalidate_icache(ram_physical_address, dtb_size);
+        asm::clean_dcache_and_invalidate_icache(kernel_physical_address, kernel_size);
+    };
+
     /* Parse the Linux kernel header */
     let header = unsafe { &*(kernel_physical_address as *const KernelHeader) };
     if header.magic != 0x644D5241 {

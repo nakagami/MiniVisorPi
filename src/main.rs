@@ -151,15 +151,33 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
         enable_net_interrupt(int_id, &distributor);
     }
 
+    /* Check PSCI version.
+     *
+     * Some platforms (e.g. Raspberry Pi 4's stock firmware) provide no
+     * EL3/PSCI firmware at all -- their DTB has no `/psci` node and CPUs
+     * are instead brought up via the ARM "spin-table" protocol (see
+     * `is_spin_table_enable_method`/`launch_cpu`). Executing `smc` on such
+     * hardware is UNDEFINED (there is no EL3 to service it) and traps to
+     * the current-EL synchronous vector, which is just an infinite loop
+     * (see `exception.rs`), silently hanging the hypervisor with no
+     * output at all. Only probe PSCI when the DTB actually advertises it. */
+    if dtb
+        .search_node_by_compatible(b"arm,psci-0.2", None)
+        .or_else(|| dtb.search_node_by_compatible(b"arm,psci", None))
+        .is_some()
+    {
+        let (major_version, minor_version) =
+            psci::check_psci_version().expect("PSCI is not supported");
+        println!("PSCI version {major_version}.{minor_version}");
+    } else {
+        println!("PSCI is not present in the devicetree; using spin-table CPU bring-up only.");
+    }
+
     *VIRTIO_BLK.lock() = virtblk;
     unsafe {
         (&raw mut FAT32).as_mut().unwrap().write(fat32);
         (&raw mut DTB).as_mut().unwrap().write(dtb);
     }
-
-    /* Check PSCI version */
-    let (major_version, minor_version) = psci::check_psci_version().expect("PSCI is not supported");
-    println!("PSCI version {major_version}.{minor_version}");
 
     vm::boot_vm(boot_address, argument)
 }
@@ -510,7 +528,8 @@ fn handle_net_rx() {
 
 
 pub fn init_fat32(blk: &mut dyn drivers::block_device::BlockDevice) -> fat32::Fat32 {
-    #[repr(C)]
+    #[repr(C, packed)]
+    #[derive(Clone, Copy)]
     struct PartitionTableEntry {
         boot_flag: u8,
         first_sector: [u8; 3],
@@ -521,15 +540,24 @@ pub fn init_fat32(blk: &mut dyn drivers::block_device::BlockDevice) -> fat32::Fa
     }
     const PARTITION_TABLE_BASE: usize = 0x1BE;
     /* Read the MBR */
-    let mut mbr: [u8; 512] = [0; 512];
+    #[repr(align(4))]
+    struct AlignedBuffer([u8; 512]);
+    let mut mbr = AlignedBuffer([0; 512]);
     blk.read(&mut mbr as *mut _ as usize, 0, 512)
         .expect("Failed to read first 512bytes");
+    let mbr = &mbr.0;
     /* Verify the BOOT signature */
     assert_eq!(u16::from_le_bytes([mbr[510], mbr[511]]), 0xAA55);
 
-    /* Parse the partition table */
+    /* Parse the partition table. PARTITION_TABLE_BASE (0x1BE) is not
+     * 4-byte aligned, so the entries (which contain u32 fields) cannot be
+     * referenced in place; read them out as `packed` (alignment-1) values
+     * via a by-value copy instead, which is always sound regardless of
+     * source alignment. */
     let partition_table = unsafe {
-        &*(&mbr[PARTITION_TABLE_BASE] as *const _ as usize as *const [PartitionTableEntry; 4])
+        core::ptr::read_unaligned(
+            &mbr[PARTITION_TABLE_BASE] as *const _ as *const [PartitionTableEntry; 4],
+        )
     };
     let mut fat32 = Err(());
     for e in partition_table {
