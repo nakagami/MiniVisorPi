@@ -196,6 +196,9 @@ impl GicCpuInterface {
     const GICC_EOIR: usize = 0x010;
     const GICC_IAR_INT_ID: u32 = (1 << 10) - 1;
     const GICC_DIR: usize = 0x1000;
+    /// Value read back from GICC_IAR's INT_ID field when no interrupt is
+    /// pending for this CPU interface (GICv2 spec, ID 1023).
+    pub const SPURIOUS_INT_ID: u32 = 1023;
 
     pub fn new(base_address: usize) -> Self {
         unsafe { GICC_BASE_ADDRESS = base_address };

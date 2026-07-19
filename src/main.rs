@@ -253,6 +253,9 @@ fn init_serial_port(dtb: &dtb::Dtb) -> Result<(), usize> {
     unsafe { PL011_INT_ID = interrupt_number };
     *PL011_DEVICE.lock() = pl011;
     serial::init_default_serial_port(&PL011_DEVICE);
+    println!(
+        "PL011: base={pl011_base:#X} range={pl011_range:#X} interrupt_id={interrupt_number}"
+    );
     Ok(())
 }
 

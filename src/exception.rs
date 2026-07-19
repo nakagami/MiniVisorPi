@@ -272,9 +272,21 @@ extern "C" fn irq_handler() {
         deactivate = false; /* Deactivate is handled by the VGIC */
     } else if interrupt_number == unsafe { crate::VIRTIO_NET_INT_ID } {
         crate::handle_net_rx();
+    } else if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
+        /* An interrupt fired that isn't recognized by any branch above (e.g.
+         * a mismatch between the physical SPI number actually wired to a
+         * device and the ID this driver computed/registered for it). Report
+         * it instead of silently EOI/deactivating it, since otherwise the
+         * device's events go unnoticed with no diagnostic at all. */
+        println!("Unhandled physical interrupt: {interrupt_number}");
     }
-    GicCpuInterface::drop_priority(interrupt_number, group);
-    if deactivate {
-        GicCpuInterface::deactivate(interrupt_number);
+    /* GICv2 requires software not to perform a priority drop/deactivation
+     * for the spurious ID (1023): there is no corresponding pending
+     * interrupt to drop/deactivate, so software must simply ignore it. */
+    if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
+        GicCpuInterface::drop_priority(interrupt_number, group);
+        if deactivate {
+            GicCpuInterface::deactivate(interrupt_number);
+        }
     }
 }
