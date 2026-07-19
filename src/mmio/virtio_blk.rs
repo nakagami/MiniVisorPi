@@ -194,7 +194,7 @@ impl VirtioBlkMmio {
 }
 
 impl MmioHandler for VirtioBlkMmio {
-    fn read(&mut self, offset: usize, _access_width: u64) -> Result<u64, ()> {
+    fn read(&mut self, offset: usize, access_width: u64) -> Result<u64, ()> {
         let mut value = 0u64;
         match offset {
             VIRTIO_MMIO_MAGIC => {
@@ -233,6 +233,19 @@ impl MmioHandler for VirtioBlkMmio {
                     /* Block device size */
                     let capacity = self.file.get_file_size() >> 9;
                     value = (capacity >> (config_offset * 8)) as u64;
+                    /* Diagnostic: on real Raspberry Pi 4 hardware, the guest's virtio_blk
+                     * driver has been observed reporting a 0-block capacity despite
+                     * self.file (captured at VM creation, see vm.rs's own diagnostic
+                     * print) holding the correct file size. Print every actual config-
+                     * space capacity read as it's serviced, to determine whether this
+                     * handler ever sees a corrupted (zeroed) self.file by the time the
+                     * guest queries it, or whether the corruption happens downstream of
+                     * this return value (e.g. in the exception return / register
+                     * write-back path, or within the guest itself). */
+                    println!(
+                        "VirtioBlk config read: offset={config_offset} access_width={access_width} file_size={:#X} capacity={capacity:#X} value={value:#X}",
+                        self.file.get_file_size()
+                    );
                 }
             }
             _ => { /* Unimplemented */ }
@@ -280,6 +293,12 @@ impl MmioHandler for VirtioBlkMmio {
             }
             VIRTIO_MMIO_STATUS => {
                 if value == 0 {
+                    /* Diagnostic: reset does not touch self.file (only queue/negotiation
+                     * state), so it should never be the cause of a 0-block capacity;
+                     * print each reset to rule out (or confirm) an unexpected extra
+                     * reset cycle occurring between VM creation and the guest's config
+                     * space read. */
+                    println!("VirtioBlk device reset (STATUS write 0)");
                     self.queue_size = 0;
                     self.queue_ready = false;
                     self.page_size = 1 << 12;
