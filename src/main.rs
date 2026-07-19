@@ -112,6 +112,13 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     let (gicv_base_address, gicv_size) = get_gic_virtual_cpu_interface(&dtb);
 
     enable_serial_port_interrupt(&PL011_DEVICE.lock(), &distributor);
+    /* Called after the PL011_DEVICE lock (held for the whole statement above) has
+     * been released: dump_spi_config() prints via println!, which itself needs to
+     * lock PL011_DEVICE, so calling it while still holding that lock would
+     * self-deadlock (this crate's Mutex is a simple non-reentrant spinlock). */
+    if unsafe { PL011_INT_ID } != 0 {
+        distributor.dump_spi_config(unsafe { PL011_INT_ID });
+    }
 
     generic_timer::init_generic_timer_global(&dtb);
 
@@ -410,7 +417,6 @@ fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv2::GicDi
     distributor.set_pending(int_id, false);
     distributor.set_enable(int_id, true);
     pl011.enable_interrupt();
-    distributor.dump_spi_config(int_id);
 }
 
 
