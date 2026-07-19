@@ -304,13 +304,23 @@ fn data_abort_handler(registers: &mut Registers, esr_el2: u64) {
         } else {
             *register & (u32::MAX as u64)
         };
-        vm::get_current_vm()
-            .handle_mmio_write(address as usize, access_width, register_value)
-            .expect("Failed to handle MMIO");
+        if let Err(()) = vm::get_current_vm().handle_mmio_write(
+            address as usize,
+            access_width,
+            register_value,
+        ) {
+            panic!(
+                "Failed to handle MMIO write: address={address:#X} \
+                 access_width={access_width} value={register_value:#X}"
+            );
+        }
     } else {
-        *register = vm::get_current_vm()
-            .handle_mmio_read(address as usize, access_width)
-            .expect("Failed to handle MMIO");
+        match vm::get_current_vm().handle_mmio_read(address as usize, access_width) {
+            Ok(value) => *register = value,
+            Err(()) => panic!(
+                "Failed to handle MMIO read: address={address:#X} access_width={access_width}"
+            ),
+        }
     }
 
     unsafe { asm::advance_elr_el2() };
