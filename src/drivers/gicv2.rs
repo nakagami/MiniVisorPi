@@ -228,6 +228,19 @@ impl GicCpuInterface {
     const GICC_EOIR: usize = 0x010;
     const GICC_IAR_INT_ID: u32 = (1 << 10) - 1;
     const GICC_DIR: usize = 0x1000;
+    /// Aliased CPU Interface registers: when the GIC implements the Security Extensions and
+    /// this CPU interface access is treated as Non-secure (as on real hardware, unlike
+    /// QEMU's `secure=off` GIC where every access is treated as secure), the *normal*
+    /// GICC_IAR/EOIR only ever see Group 1 (Non-secure) interrupts, while the *Aliased*
+    /// GICC_AIAR/AEOIR give Non-secure software a way to acknowledge/complete Group 0
+    /// (Secure) interrupts -- which the GIC signals as FIQ rather than IRQ. This matters
+    /// because on real hardware, GICD_IGROUPR writes for a given SPI are RAZ/WI (ignored)
+    /// from a Non-secure access unless that SPI was already assigned to Non-secure Group 1
+    /// by secure-world firmware, so any SPI nobody pre-assigned (e.g. the PL011's, which
+    /// stock Raspberry Pi firmware/U-Boot never touches since they only poll it) stays
+    /// Group 0 and arrives as a physical FIQ instead of the IRQ this driver expects.
+    const GICC_AIAR: usize = 0x020;
+    const GICC_AEOIR: usize = 0x024;
     /// Value read back from GICC_IAR's INT_ID field when no interrupt is
     /// pending for this CPU interface (GICv2 spec, ID 1023).
     pub const SPURIOUS_INT_ID: u32 = 1023;
@@ -256,6 +269,15 @@ impl GicCpuInterface {
         (iar & Self::GICC_IAR_INT_ID, GicGroup::NonSecureGroup1)
     }
 
+    /// Acknowledges a Group 0 interrupt delivered as a physical FIQ, using the Aliased
+    /// Interrupt Acknowledge Register (see the `GICC_AIAR` doc comment above).
+    pub fn get_acknowledge_group0() -> u32 {
+        let base_address = unsafe { GICC_BASE_ADDRESS };
+        let aiar =
+            unsafe { core::ptr::read_volatile((base_address + Self::GICC_AIAR) as *const u32) };
+        aiar & Self::GICC_IAR_INT_ID
+    }
+
     pub fn drop_priority(int_id: u32, _group: GicGroup) {
         let base_address = unsafe { GICC_BASE_ADDRESS };
         unsafe {
@@ -266,6 +288,15 @@ impl GicCpuInterface {
     pub fn deactivate(int_id: u32) {
         let base_address = unsafe { GICC_BASE_ADDRESS };
         unsafe { core::ptr::write_volatile((base_address + Self::GICC_DIR) as *mut u32, int_id) };
+    }
+
+    /// Completes a Group 0 FIQ acknowledged via `get_acknowledge_group0`. Since
+    /// `GICC_CTLR_EOI_MODE_NS` only splits priority-drop/deactivate for the Non-secure
+    /// (Group 1/IRQ) path, a single write to the Aliased EOI register both drops priority
+    /// and deactivates the Group 0 interrupt -- no separate `deactivate` call is needed.
+    pub fn eoi_group0(int_id: u32) {
+        let base_address = unsafe { GICC_BASE_ADDRESS };
+        unsafe { core::ptr::write_volatile((base_address + Self::GICC_AEOIR) as *mut u32, int_id) };
     }
 
     fn write_register(&self, register: usize, data: u32) {

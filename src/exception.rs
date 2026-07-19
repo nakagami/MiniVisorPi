@@ -100,7 +100,26 @@ irq_current_el_stack_pointer_x:
 
 .balign 0x080
 fiq_current_el_stack_pointer_x:
-    b   fiq_current_el_stack_pointer_x
+    sub sp,   sp, #(8 * 32)
+    stp x30, xzr, [sp, #( 15 * 16)]
+    stp x28, x29, [sp, #( 14 * 16)]
+    stp x26, x27, [sp, #( 13 * 16)]
+    stp x24, x25, [sp, #( 12 * 16)]
+    stp x22, x23, [sp, #( 11 * 16)]
+    stp x20, x21, [sp, #( 10 * 16)]
+    stp x18, x19, [sp, #(  9 * 16)]
+    stp x16, x17, [sp, #(  8 * 16)]
+    stp x14, x15, [sp, #(  7 * 16)]
+    stp x12, x13, [sp, #(  6 * 16)]
+    stp x10, x11, [sp, #(  5 * 16)]
+    stp  x8,  x9, [sp, #(  4 * 16)]
+    stp  x6,  x7, [sp, #(  3 * 16)]
+    stp  x4,  x5, [sp, #(  2 * 16)]
+    stp  x2,  x3, [sp, #(  1 * 16)]
+    stp  x0,  x1, [sp, #(  0 * 16)]
+    mov  x0, sp
+    adr x30, exit_exception
+    b   {fiq_handler}
 
 .balign 0x080
 s_error_current_el_stack_pointer_x:
@@ -154,7 +173,26 @@ irq_lower_el_aarch64:
 
 .balign 0x080
 fiq_lower_el_aarch64:
-    b   fiq_lower_el_aarch64
+    sub sp,   sp, #(8 * 32)
+    stp x30, xzr, [sp, #( 15 * 16)]
+    stp x28, x29, [sp, #( 14 * 16)]
+    stp x26, x27, [sp, #( 13 * 16)]
+    stp x24, x25, [sp, #( 12 * 16)]
+    stp x22, x23, [sp, #( 11 * 16)]
+    stp x20, x21, [sp, #( 10 * 16)]
+    stp x18, x19, [sp, #(  9 * 16)]
+    stp x16, x17, [sp, #(  8 * 16)]
+    stp x14, x15, [sp, #(  7 * 16)]
+    stp x12, x13, [sp, #(  6 * 16)]
+    stp x10, x11, [sp, #(  5 * 16)]
+    stp  x8,  x9, [sp, #(  4 * 16)]
+    stp  x6,  x7, [sp, #(  3 * 16)]
+    stp  x4,  x5, [sp, #(  2 * 16)]
+    stp  x2,  x3, [sp, #(  1 * 16)]
+    stp  x0,  x1, [sp, #(  0 * 16)]
+    mov  x0, sp
+    adr x30, exit_exception
+    b   {fiq_handler}
 
 .balign 0x080
 s_error_lower_el_aarch64:
@@ -198,6 +236,7 @@ exit_exception:
 ",
 irq_handler = sym irq_handler,
 synchronous_handler = sym synchronous_handler,
+fiq_handler = sym fiq_handler,
 );
 
 pub fn setup_exception() {
@@ -215,6 +254,25 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
         _ => {
             panic!("Unknown Exception: {}", ec >> ESR_EL2_EC_BITS_OFFSET);
         }
+    }
+}
+
+/// Handles a physical FIQ, i.e. a Group 0 (Secure) interrupt. On real hardware, an SPI
+/// that no secure-world firmware ever explicitly assigned to Non-secure Group 1 stays in
+/// Group 0 (see the `GICC_AIAR` doc comment in drivers/gicv2.rs), so this is the actual
+/// delivery path for e.g. the PL011's physical interrupt on real Raspberry Pi 4 hardware,
+/// even though this driver's own `set_group` call requests Group 1. Dispatches the same
+/// way `irq_handler` does, since from this hypervisor's perspective a Group 0 interrupt
+/// routed here still just means "a device this hypervisor owns wants attention".
+extern "C" fn fiq_handler() {
+    let interrupt_number = GicCpuInterface::get_acknowledge_group0();
+    if interrupt_number == unsafe { crate::PL011_INT_ID } {
+        crate::handle_input(&crate::PL011_DEVICE);
+    } else if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
+        println!("Unhandled physical FIQ (Group 0): {interrupt_number}");
+    }
+    if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
+        GicCpuInterface::eoi_group0(interrupt_number);
     }
 }
 
