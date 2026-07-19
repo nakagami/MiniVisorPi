@@ -148,6 +148,38 @@ impl GicDistributor {
         (self.read_register(Self::GICD_ITARGETSR) & 0xFF) as u8
     }
 
+    /// Reads back an SPI's group/enable/target/priority/config bits and prints them.
+    /// Used to confirm on real hardware whether writes issued by `set_group`/`set_enable`/
+    /// `set_target`/`set_priority`/`set_trigger_mode` actually stuck (e.g. some GIC
+    /// implementations RAZ/WI GICD_IGROUPR writes from Non-secure state when the interrupt
+    /// was not already assigned to Non-secure Group 1 by secure-world firmware).
+    pub fn dump_spi_config(&self, int_id: u32) {
+        let group_reg = self.read_register(
+            Self::GICD_IGROUPR + ((int_id / u32::BITS) as usize) * size_of::<u32>(),
+        );
+        let group_bit = (group_reg >> (int_id & (u32::BITS - 1))) & 1;
+        let enable_reg = self.read_register(
+            Self::GICD_ISENABLER + ((int_id / u32::BITS) as usize) * size_of::<u32>(),
+        );
+        let enable_bit = (enable_reg >> (int_id & (u32::BITS - 1))) & 1;
+        let target = (self.read_register(
+            Self::GICD_ITARGETSR + ((int_id >> 2) as usize) * size_of::<u32>(),
+        ) >> ((int_id & 0b11) << 3))
+            & 0xFF;
+        let priority = (self.read_register(
+            Self::GICD_IPRIORITYR + ((int_id >> 2) as usize) * size_of::<u32>(),
+        ) >> ((int_id & 0b11) << 3))
+            & 0xFF;
+        let cfg = (self.read_register(
+            Self::GICD_ICFGR + ((int_id / (u32::BITS / 2)) as usize) * size_of::<u32>(),
+        ) >> ((int_id & (u32::BITS / 2 - 1)) * 2))
+            & 0b11;
+        println!(
+            "GICD SPI {int_id}: group={group_bit} enable={enable_bit} target={target:#04X} \
+             priority={priority:#04X} cfg={cfg:#04b}"
+        );
+    }
+
     fn read_register(&self, register: usize) -> u32 {
         unsafe { core::ptr::read_volatile((self.base_address + register) as *const u32) }
     }

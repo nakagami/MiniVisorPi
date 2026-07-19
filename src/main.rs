@@ -410,6 +410,7 @@ fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv2::GicDi
     distributor.set_pending(int_id, false);
     distributor.set_enable(int_id, true);
     pl011.enable_interrupt();
+    distributor.dump_spi_config(int_id);
 }
 
 
