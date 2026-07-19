@@ -215,6 +215,16 @@ pub fn create_vm(
     let disk_file = fat32
         .search_file(core::str::from_utf8(&file_name).unwrap())
         .expect("Failed to find Disk");
+    /* Diagnostic: on real Raspberry Pi 4 hardware, virtio_blk in the guest has
+     * sometimes reported a 0-block capacity despite the disk image file being
+     * loaded successfully (and listed with the correct size by
+     * Fat32::list_files() moments earlier). Print the size captured here to
+     * determine whether search_file() itself already returns 0, or whether
+     * the FileInfo/VirtioBlkMmio is corrupted sometime after this point. */
+    println!(
+        "DISK{vm_id} file size at VM creation: {:#X}",
+        disk_file.get_file_size()
+    );
     mmio_handlers.push_back(MmioEntry::new(
         0xa000000,
         0x0200,
