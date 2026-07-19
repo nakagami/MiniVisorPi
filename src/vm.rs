@@ -177,6 +177,28 @@ pub fn create_vm(
     let vm_id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);
     let cpu_mpidr = asm::get_mpidr_el1();
 
+    /* Diagnostic (temporary): check whether the just-allocated guest RAM
+     * physical range overlaps the host-owned FAT32 root-directory buffer.
+     * If it does, the guest zeroing/using its own RAM during early boot
+     * would silently corrupt that buffer (and anything else backed by the
+     * same physical pages), which would explain a virtio-blk 0-capacity
+     * bug observed after VM creation but before the guest's first MMIO
+     * access to the device. */
+    let (fat_buf_start, fat_buf_end) = fat32.debug_buffer_range();
+    let ram_end = ram_physical_address + RAM_SIZE;
+    println!(
+        "Guest RAM: [{:#X} ~ {:#X}], FAT32 root dir buffer: [{:#X} ~ {:#X}]{}",
+        ram_physical_address,
+        ram_end,
+        fat_buf_start,
+        fat_buf_end,
+        if fat_buf_start < ram_end && fat_buf_end > ram_physical_address {
+            " <-- OVERLAP!"
+        } else {
+            ""
+        }
+    );
+
     /* Configure hardware related to virtualization */
     /* Set up registers */
     setup_hypervisor_registers();
@@ -215,7 +237,34 @@ pub fn create_vm(
     let disk_file = fat32
         .search_file(core::str::from_utf8(&file_name).unwrap())
         .expect("Failed to find Disk");
+    /* Diagnostic (temporary): on real Raspberry Pi 4 hardware, virtio_blk in
+     * the guest has intermittently reported a 0-block capacity despite
+     * Fat32::list_files() printing the correct size for the same file
+     * moments earlier from the same in-memory root directory buffer. Print
+     * the size captured here again to narrow down whether the corruption
+     * (if any) happens before or after this point. */
+    println!(
+        "DISK{vm_id} file size at VM creation: {:#X}",
+        disk_file.get_file_size()
+    );
     let virtio_blk_mmio = Arc::new(Mutex::new(VirtioBlkMmio::new(disk_file)));
+    /* Diagnostic (temporary): check whether the Arc<Mutex<VirtioBlkMmio>>
+     * heap allocation itself (which holds the FileInfo/file_size by value)
+     * falls inside the guest RAM physical range. If it does, anything the
+     * guest writes to its own low RAM during early boot (BSS clear, page
+     * tables, etc.) would silently corrupt this host-owned struct. */
+    let virtio_blk_mmio_addr = Arc::as_ptr(&virtio_blk_mmio) as usize;
+    println!(
+        "VirtioBlkMmio heap address: {:#X} (Guest RAM: [{:#X} ~ {:#X}]){}",
+        virtio_blk_mmio_addr,
+        ram_physical_address,
+        ram_end,
+        if virtio_blk_mmio_addr >= ram_physical_address && virtio_blk_mmio_addr < ram_end {
+            " <-- OVERLAP!"
+        } else {
+            ""
+        }
+    );
     mmio_handlers.push_back(MmioEntry::new(0xa000000, 0x0200, virtio_blk_mmio));
 
     /* GIC Distributor(Virtual) */

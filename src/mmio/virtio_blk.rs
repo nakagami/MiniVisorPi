@@ -23,6 +23,9 @@ pub struct VirtioBlkMmio {
     used_ring: *mut VirtQueueUsed,
     last_avail_id: u16,
     used_id: u16,
+    /// Diagnostic-only (temporary): whether the first config-space read has
+    /// already been logged, to avoid spamming the console on every read.
+    config_read_logged: bool,
 }
 
 impl VirtioBlkMmio {
@@ -45,6 +48,7 @@ impl VirtioBlkMmio {
             used_ring: null_mut(),
             last_avail_id: 0,
             used_id: 0,
+            config_read_logged: false,
         }
     }
 
@@ -232,6 +236,18 @@ impl MmioHandler for VirtioBlkMmio {
                 if (0..8).contains(&config_offset) {
                     /* Block device size */
                     let capacity = self.file.get_file_size() >> 9;
+                    /* Diagnostic (temporary): log the file size seen at the
+                     * very first config-space read, to check whether it is
+                     * already 0 here (i.e. corruption happened before this
+                     * device was even created) or only later. */
+                    if !self.config_read_logged {
+                        self.config_read_logged = true;
+                        println!(
+                            "VirtioBlk first config read: file_size={:#X} capacity={:#X}",
+                            self.file.get_file_size(),
+                            capacity
+                        );
+                    }
                     value = (capacity >> (config_offset * 8)) as u64;
                 }
             }

@@ -622,7 +622,11 @@ impl MemoryEntry {
     }
 
     pub fn set_range(&mut self, start: usize, end: usize) {
-        assert!(start < end);
+        /* `end` is inclusive (get_size() == end - start + 1), so a valid
+         * single-byte entry legitimately has start == end. Rejecting that
+         * with `start < end` spuriously panics whenever the allocator needs
+         * to shrink an entry down to exactly one remaining byte. */
+        assert!(start <= end);
         self.start = start;
         self.end = end;
     }

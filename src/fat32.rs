@@ -217,6 +217,21 @@ impl Fat32 {
         core::str::from_utf8_mut(&mut buffer[0..p]).ok()
     }
 
+    /// Diagnostic-only (temporary): exposes the host-physical addresses and
+    /// sizes of the FAT/root-directory buffers, to check whether they
+    /// overlap a later guest-RAM allocation (which would explain the guest
+    /// silently corrupting host-owned FAT32 data during early boot).
+    pub fn debug_buffer_range(&self) -> (usize, usize) {
+        let root_directory_size = ((self.sectors_per_cluster as usize)
+            * (self.bytes_per_sector as usize)
+            >> PAGE_SHIFT)
+            + 1;
+        (
+            self.root_directory_list,
+            self.root_directory_list + (root_directory_size << PAGE_SHIFT),
+        )
+    }
+
     pub fn list_files(&self) {
         let len = ((self.bytes_per_sector as usize) * self.sectors_per_cluster as usize)
             / size_of::<DirectoryEntry>();
