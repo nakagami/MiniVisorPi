@@ -106,6 +106,30 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     setup_memory(&dtb, dtb_address, elf_address, stack_pointer);
 
     exception::setup_exception();
+    /* Mask IRQ/FIQ for the remainder of this hypervisor's own EL2 execution context,
+     * before any physical interrupt source (e.g. the PL011's) gets enabled below. This
+     * crate's Mutex (src/lock.rs) always restores whichever DAIF state it observed on
+     * lock(), so setting it once here keeps IRQ/FIQ masked at EL2 permanently, even
+     * across future lock()/unlock() cycles.
+     *
+     * This matters because handling a physical interrupt here (e.g. crate::handle_input
+     * -> vm::input_uart -> vm::get_active_vm()) requires a VM to already exist and be
+     * marked active, but no VM exists yet this early in boot (Created VM0 doesn't print
+     * until much later). If a physical interrupt fires before then while unmasked --
+     * confirmed to happen on real Raspberry Pi 4 hardware, apparently from electrical
+     * noise on the UART RX line during power-up, well before any user keypress -- it
+     * previously caused an untimely handle_input() call that corrupted VM/device state
+     * or crashed outright (e.g. Virtio-Blk reporting 0 blocks / a stray "Failed to
+     * handle MMIO" panic during early guest boot).
+     *
+     * This does not prevent the guest from receiving physical interrupts once it's
+     * actually running: HCR_EL2.{IMO,FMO} route physical IRQ/FIQ to EL2 while the guest
+     * (EL1) is executing, and exception masks only gate delivery when the target
+     * Exception level equals the CURRENTLY EXECUTING Exception level -- since EL2 is
+     * not the currently executing EL once we've eret'd into the EL1 guest, EL2's own
+     * (permanently masked) DAIF has no effect on that routed delivery. Masking here only
+     * defers delivery of any interrupt that becomes pending before the guest exists. */
+    unsafe { asm::get_daif_and_disable_irq_fiq() };
     let distributor = init_gic_distributor(&dtb);
     let _gic_cpu_interface = init_gic_cpu_interface(&dtb);
     let gic_hypervisor_interface = init_gic_hypervisor_interface(&dtb);
