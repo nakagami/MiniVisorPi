@@ -3,7 +3,12 @@ AArch64向けの小型Type1ハイパーバイザ
 
 本リポジトリは[作って理解する仮想化技術─⁠─ ハイパーバイザを実装しながら仕組みを学ぶ（技術評論社,2025）](https://gihyo.jp/book/2025/978-4-297-15012-9)で実装するハイパーバイザを改造して Raspberry Pi 4 で動作することを目指すリポジトリです。
 
-書籍では Ubunt24.04 に開発環境を構築していましたが、このリポジトリでは、Ubuntu26.04 を開発環境とし、QMENU u-boot buildroot のバージョンも上げています。
+書籍では Ubunt24.04 に開発環境を構築していましたが、このリポジトリでは、Ubuntu26.04 を使うことを想定しています。
+使用する QMENU、 u-boot、 buildroot のバージョンも上げています。
+必要なツールのインストールのために最初に以下のコマンドを実行します。
+   ```
+   ./tools/install_tools.sh
+   ```
 
 書籍と同様の手順で QEMUの環境で動作しますが、`tools-pi4`以下のスクリプトを使うとRaspberry Pi 4実機向けの起動用SDカードイメージを作成できます。
 
@@ -11,11 +16,11 @@ AArch64向けの小型Type1ハイパーバイザ
 
 1. u-boot(実機向け、`rpi_arm64_defconfig`)をビルドします。
    ```
-   tools-pi4/build_uboot.sh
+   ./tools-pi4/build_uboot.sh
    ```
 2. Linuxカーネルとrootfs(`raspberrypi4_64_defconfig`)をビルドします。
    ```
-   tools-pi4/build_buildroot.sh
+   ./tools-pi4/build_buildroot.sh
    ```
 3. MiniVisor本体(`mini.elf`)をビルドします。`cargo build-pi4`を実行すると、ビルド後に`bin-pi4/disk/mini.elf`へ自動でコピーされます。
    ```
@@ -31,7 +36,7 @@ AArch64向けの小型Type1ハイパーバイザ
    ```
 5. SDカードイメージ`bin-pi4/disk.img`を作成します
    ```
-   tools-pi4/create_sdcard.sh
+   ./tools-pi4/create_sdcard.sh
    ```
    このスクリプトは`u-boot.bin`・`config.txt`・`mini.elf`・`boot.scr`・Linuxカーネル(`Image`)・rootfs(`DISK0`)を含むFAT32イメージを`bin-pi4/disk.img`に生成します(4.で配置した`bcm2711-rpi-4-b.dtb`・`start4.elf`・`fixup4.dat`・`overlays/disable-bt.dtbo`もそのまま含まれます)。
 6. 作成した`bin-pi4/disk.img`を物理SDカードに書き込みます。`/dev/sdX`は環境に合わせて読み替えてください。
