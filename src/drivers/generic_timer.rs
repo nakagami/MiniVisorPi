@@ -38,6 +38,11 @@ pub fn init_generic_timer_local(distributor: &gicv2::GicDistributor) {
 }
 
 pub fn generic_timer_interrupt_handler() {
+    static TICK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let ticks = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+    if ticks % 1000 == 0 {
+        println!("generic_timer: heartbeat tick={ticks}");
+    }
     vm::get_current_vm()
         .get_gic_distributor_mmio()
         .lock()

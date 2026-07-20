@@ -318,21 +318,34 @@ impl MmioHandler for VirtioNetMmio {
             }
             VIRTIO_MMIO_QUEUE_NUM => {
                 let page_size = self.page_size;
+                let queue_sel = self.queue_sel;
                 let queue = self.current_queue();
                 queue.queue_size = value as usize;
                 queue.recompute_rings(page_size);
+                println!("Virtio-Net: queue {queue_sel} QUEUE_NUM set to {value}");
             }
             VIRTIO_MMIO_QUEUE_PFN => {
                 let page_size = self.page_size;
+                let queue_sel = self.queue_sel;
                 if let Some(address) =
                     get_current_vm().get_physical_address((value as usize) * page_size)
                 {
                     let queue = self.current_queue();
                     queue.descriptor = address as *mut _;
                     queue.recompute_rings(page_size);
+                    println!(
+                        "Virtio-Net: queue {queue_sel} PFN set (guest_pfn={value:#X} \
+                         host_address={address:#X})"
+                    );
+                } else {
+                    println!(
+                        "Virtio-Net: queue {queue_sel} PFN set but address translation \
+                         failed (guest_pfn={value:#X})"
+                    );
                 }
             }
             VIRTIO_MMIO_QUEUE_NOTIFY => {
+                println!("Virtio-Net: QUEUE_NOTIFY value={value}");
                 if value as usize == QUEUE_INDEX_TX {
                     self.process_tx();
                 }
@@ -341,6 +354,7 @@ impl MmioHandler for VirtioNetMmio {
                 self.interrupt_status &= !(value as u32);
             }
             VIRTIO_MMIO_STATUS => {
+                println!("Virtio-Net: STATUS write value={value:#X}");
                 if value == 0 {
                     self.page_size = 1 << 12;
                     self.interrupt_status = 0;
