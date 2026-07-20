@@ -12,6 +12,7 @@ mod dtb;
 mod drivers {
     pub mod block_device;
     pub mod generic_timer;
+    pub mod genet;
     pub mod gicv2;
     pub mod pl011;
     pub mod sdhci;
@@ -37,7 +38,7 @@ mod vgic;
 mod vm;
 
 use block_backend::BlockBackend;
-use drivers::{generic_timer, gicv2, pl011, virtio_blk, virtio_net};
+use drivers::{generic_timer, genet, gicv2, pl011, virtio_blk, virtio_net};
 use lock::Mutex;
 use psci::PsciErrorCodes;
 use serial::SerialDevice;
@@ -50,13 +51,45 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 struct GlobalAllocator {}
 
+enum PhysicalNet {
+    Virtio(virtio_net::VirtioNet),
+    Genet(genet::Genet),
+}
+
+impl PhysicalNet {
+    fn get_mac_address(&self) -> [u8; 6] {
+        match self {
+            Self::Virtio(net) => net.get_mac_address(),
+            Self::Genet(net) => net.get_mac_address(),
+        }
+    }
+
+    fn send(&mut self, buffer_address: usize, length: usize) -> Result<(), ()> {
+        match self {
+            Self::Virtio(net) => net.send(buffer_address, length),
+            Self::Genet(net) => net.send(buffer_address, length),
+        }
+    }
+
+    fn poll_rx(&mut self, buffer: &mut [u8]) -> Option<usize> {
+        match self {
+            Self::Virtio(net) => net.poll_rx(buffer),
+            Self::Genet(net) => net.poll_rx(buffer),
+        }
+    }
+
+    fn requires_wfx_polling(&self) -> bool {
+        matches!(self, Self::Genet(_))
+    }
+}
+
 /// Global variable storage
 static PL011_DEVICE: Mutex<pl011::Pl011> = Mutex::new(pl011::Pl011::invalid());
 static mut PL011_INT_ID: u32 = 0;
 static MEMORY_ALLOCATOR: Mutex<memory_allocator::MemoryAllocator> =
     Mutex::new(memory_allocator::MemoryAllocator::new());
 static VIRTIO_BLK: Mutex<BlockBackend> = Mutex::new(BlockBackend::invalid());
-static VIRTIO_NET: Mutex<Option<virtio_net::VirtioNet>> = Mutex::new(None);
+static PHYSICAL_NET: Mutex<Option<PhysicalNet>> = Mutex::new(None);
 static mut VIRTIO_NET_INT_ID: u32 = 0;
 static mut FAT32: MaybeUninit<fat32::Fat32> = MaybeUninit::uninit();
 #[global_allocator]
@@ -163,7 +196,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
     };
     let fat32 = init_fat32(&mut virtblk);
 
-    let (net, net_int_id, net_mac) = init_virtio_net(&dtb);
+    let (net, net_int_id, net_mac) = init_physical_net(&dtb);
 
     let (boot_address, argument) = vm::create_vm(
         &fat32,
@@ -177,7 +210,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
 
     /* The physical VM is now active: it is now safe to enable the
      * Virtio-Net interrupt, since handle_net_rx() requires an active VM. */
-    *VIRTIO_NET.lock() = net;
+    *PHYSICAL_NET.lock() = net;
     if let Some(int_id) = net_int_id {
         enable_net_interrupt(int_id, &distributor);
     }
@@ -443,7 +476,6 @@ fn enable_serial_port_interrupt(pl011: &pl011::Pl011, distributor: &gicv2::GicDi
     pl011.enable_interrupt();
 }
 
-
 fn init_virtio_blk(dtb: &dtb::Dtb) -> Option<virtio_blk::VirtioBlk> {
     let mut virtio = None;
     loop {
@@ -464,12 +496,74 @@ fn init_virtio_blk(dtb: &dtb::Dtb) -> Option<virtio_blk::VirtioBlk> {
     }
 }
 
+/// Searches the DTB for Raspberry Pi 4's BCM2711 GENET controller and
+/// initializes the physical RX/TX data path.
+fn init_genet(dtb: &dtb::Dtb) -> Option<genet::Genet> {
+    const GENET_COMPATIBLE_LIST: &[&[u8]] = &[b"brcm,bcm2711-genet-v5", b"brcm,genet-v5"];
+
+    for compatible in GENET_COMPATIBLE_LIST {
+        let mut node = None;
+        loop {
+            node = dtb.search_node_by_compatible(compatible, node.as_ref());
+            match &node {
+                Some(genet_node) => {
+                    if !dtb.is_node_operational(genet_node) {
+                        continue;
+                    }
+                    let Some((base_address, range)) = dtb.read_reg_property(genet_node, 0) else {
+                        continue;
+                    };
+                    let base_address = dtb.translate_soc_address(base_address);
+                    let Ok(net) = genet::Genet::new(base_address, range) else {
+                        println!("GENET: probe failed at base={base_address:#X}");
+                        continue;
+                    };
+
+                    let (phy_id1, phy_id2) = net.get_phy_id();
+                    println!(
+                        "GENET: base={:#X} phy_addr={} phy_id={:04X}:{:04X}",
+                        net.get_base_address(),
+                        net.get_phy_address(),
+                        phy_id1,
+                        phy_id2
+                    );
+
+                    match net.wait_link_up(3_000) {
+                        Ok(link) if link.is_up() => {
+                            println!(
+                                "GENET link is up (phy_link={} mac_link={})",
+                                link.phy_link, link.mac_link
+                            );
+                        }
+                        Ok(link) => {
+                            println!(
+                                "GENET link is down (phy_link={} mac_link={})",
+                                link.phy_link, link.mac_link
+                            );
+                        }
+                        Err(()) => {
+                            println!("GENET: failed to read link status");
+                        }
+                    }
+                    return Some(net);
+                }
+                None => break,
+            }
+        }
+    }
+    println!("GENET device is not present.");
+    None
+}
+
 /// Searches the DTB for an SDHCI-compatible microSD controller (e.g.
 /// Raspberry Pi 4's EMMC2, `compatible = "brcm,bcm2711-emmc2"`) and, if
 /// found and operational, initializes it and probes for a card.
 fn init_sdhci(dtb: &dtb::Dtb) -> Option<drivers::sdhci::Sdhci> {
-    const SDHCI_COMPATIBLE_LIST: &[&[u8]] =
-        &[b"brcm,bcm2711-emmc2", b"brcm,sdhci-brcmstb", b"generic-sdhci"];
+    const SDHCI_COMPATIBLE_LIST: &[&[u8]] = &[
+        b"brcm,bcm2711-emmc2",
+        b"brcm,sdhci-brcmstb",
+        b"generic-sdhci",
+    ];
     for compatible in SDHCI_COMPATIBLE_LIST {
         let mut node = None;
         loop {
@@ -497,10 +591,11 @@ fn init_sdhci(dtb: &dtb::Dtb) -> Option<drivers::sdhci::Sdhci> {
 /// support VIRTIO_NET_F_MAC (locally administered, QEMU/virtual convention).
 const DEFAULT_MAC_ADDRESS: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 
-/// Searches the DTB for a `virtio,mmio` node backed by a Virtio-Net device,
-/// initializes the physical driver and returns it together with its GIC
-/// interrupt id (if any) and the MAC address to expose to the guest.
-fn init_virtio_net(dtb: &dtb::Dtb) -> (Option<virtio_net::VirtioNet>, Option<u32>, [u8; 6]) {
+/// Initializes the physical network backend.
+///
+/// 1. QEMU: use real virtio-net hardware as before.
+/// 2. Raspberry Pi 4: fall back to BCM2711 GENET.
+fn init_physical_net(dtb: &dtb::Dtb) -> (Option<PhysicalNet>, Option<u32>, [u8; 6]) {
     let mut node = None;
     loop {
         node = dtb.search_node_by_compatible(b"virtio,mmio", node.as_ref());
@@ -517,17 +612,29 @@ fn init_virtio_net(dtb: &dtb::Dtb) -> (Option<virtio_net::VirtioNet>, Option<u32
                             int_id = Some(gicv2::GIC_SPI_BASE + u32::from_be(interrupts[1]));
                         }
                     }
-                    let mac = net.get_mac_address();
-                    let mac = if mac == [0u8; 6] { DEFAULT_MAC_ADDRESS } else { mac };
-                    return (Some(net), int_id, mac);
+                    let backend = PhysicalNet::Virtio(net);
+                    let mac = backend.get_mac_address();
+                    let mac = if mac == [0u8; 6] {
+                        DEFAULT_MAC_ADDRESS
+                    } else {
+                        mac
+                    };
+                    return (Some(backend), int_id, mac);
                 }
             }
             None => {
-                println!("Virtio-Net device is not present.");
-                return (None, None, DEFAULT_MAC_ADDRESS);
+                break;
             }
         }
     }
+
+    let Some(net) = init_genet(dtb) else {
+        println!("Virtio-Net/GENET physical backend is not present.");
+        return (None, None, DEFAULT_MAC_ADDRESS);
+    };
+    let backend = PhysicalNet::Genet(net);
+    let mac = backend.get_mac_address();
+    (Some(backend), None, if mac == [0u8; 6] { DEFAULT_MAC_ADDRESS } else { mac })
 }
 
 /// Enables the physical Virtio-Net RX interrupt. Must only be called once a
@@ -550,16 +657,37 @@ fn enable_net_interrupt(int_id: u32, distributor: &gicv2::GicDistributor) {
 /// Called from the physical Virtio-Net IRQ handler: drains every received
 /// Ethernet frame and forwards it to the currently active VM.
 fn handle_net_rx() {
+    const MAX_PACKETS_PER_CALL: usize = 16;
     let mut buffer = [0u8; drivers::virtio_net::VIRTIO_NET_RX_BUFFER_SIZE];
-    let mut net = VIRTIO_NET.lock();
+    let mut net = PHYSICAL_NET.lock();
     let Some(net) = net.as_mut() else {
         return;
     };
-    while let Some(length) = net.poll_rx(&mut buffer) {
+    let mut processed = 0usize;
+    while processed < MAX_PACKETS_PER_CALL {
+        let Some(length) = net.poll_rx(&mut buffer) else {
+            break;
+        };
         vm::input_net_packet(&buffer[..length]);
+        processed += 1;
     }
 }
 
+fn needs_net_polling_on_wfx() -> bool {
+    PHYSICAL_NET
+        .lock()
+        .as_ref()
+        .map(PhysicalNet::requires_wfx_polling)
+        .unwrap_or(false)
+}
+
+fn get_guest_net_mac() -> [u8; 6] {
+    PHYSICAL_NET
+        .lock()
+        .as_ref()
+        .map(PhysicalNet::get_mac_address)
+        .unwrap_or(DEFAULT_MAC_ADDRESS)
+}
 
 pub fn init_fat32(blk: &mut dyn drivers::block_device::BlockDevice) -> fat32::Fat32 {
     #[repr(C, packed)]
@@ -717,7 +845,7 @@ extern "C" fn core_main() -> ! {
         &gic_hypervisor_interface,
         gicv_base_address,
         gicv_size,
-        DEFAULT_MAC_ADDRESS,
+        get_guest_net_mac(),
     );
     vm::boot_vm(boot_address, argument)
 }

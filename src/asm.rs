@@ -140,6 +140,36 @@ pub unsafe fn invalidate_cache(address: usize) {
     unsafe { asm!("dc ivac, {}", in(reg) address) };
 }
 
+fn get_dcache_line_size() -> usize {
+    let ctr_el0: u64;
+    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
+    4usize << ((ctr_el0 >> 16) & 0xF)
+}
+
+/// Cleans the D-cache for `[address, address + size)`.
+pub unsafe fn clean_dcache_range(address: usize, size: usize) {
+    let line_size = get_dcache_line_size();
+    let mut addr = address & !(line_size - 1);
+    let end = address.saturating_add(size);
+    while addr < end {
+        unsafe { asm!("dc cvac, {}", in(reg) addr) };
+        addr += line_size;
+    }
+    unsafe { asm!("dsb ish") };
+}
+
+/// Invalidates the D-cache for `[address, address + size)`.
+pub unsafe fn invalidate_dcache_range(address: usize, size: usize) {
+    let line_size = get_dcache_line_size();
+    let mut addr = address & !(line_size - 1);
+    let end = address.saturating_add(size);
+    while addr < end {
+        unsafe { asm!("dc ivac, {}", in(reg) addr) };
+        addr += line_size;
+    }
+    unsafe { asm!("dsb ish") };
+}
+
 /// Clean the D-cache to the point of unification and invalidate the
 /// I-cache for `[address, address + size)`.
 ///

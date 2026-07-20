@@ -258,16 +258,17 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
     }
 }
 
-/// Handles a guest WFI/WFE trapped to EL2 via HCR_EL2.TWI. Since the physical PL011
-/// RX interrupt never reaches this Non-secure EL2 hypervisor on real Raspberry Pi 4
-/// hardware (SPI 153 stays GIC Group 0; neither fiq_handler nor irq_handler ever runs
-/// for it), the guest can only learn about keystrokes if we poll the physical UART
-/// ourselves. A guest idling at a prompt sits in WFI, so this trap is a reliable
-/// polling point: drain the physical RX FIFO and inject any bytes into the guest's
-/// virtual PL011, then advance past the WFI so the guest re-evaluates its wait
-/// condition (and picks up the freshly injected input interrupt).
+/// Handles a guest WFI/WFE trapped to EL2 via HCR_EL2.TWI. Since physical device
+/// interrupts may not always reach this Non-secure EL2 hypervisor as expected on
+/// real Raspberry Pi 4 hardware, WFI is used as a reliable polling point:
+/// 1) drain physical UART RX and inject to the guest PL011
+/// 2) when using the GENET backend, poll physical RX and inject to guest virtio-net
+/// Then advance past WFI so the guest re-evaluates its wait condition.
 fn wfx_handler() {
     crate::handle_input(&crate::PL011_DEVICE);
+    if crate::needs_net_polling_on_wfx() {
+        crate::handle_net_rx();
+    }
     unsafe { asm::advance_elr_el2() };
 }
 

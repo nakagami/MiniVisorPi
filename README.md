@@ -45,6 +45,23 @@ AArch64向けの小型Type1ハイパーバイザ
    ```
 7. SDカードをRaspberry Pi 4に挿して起動します。
 
+## BCM2711 GENET (有線LAN) の現状
+
+Raspberry Pi 4 実機では、QEMU用の物理 Virtio-Net が存在しない場合に BCM2711 GENET を物理ネットワークbackendとして使用します。  
+実装は以下です。
+
+- MDIO 経由のPHY検出・リンク判定
+- GENET RX/TX DMAリングの初期化
+- ゲスト virtio-net (MMIO) と GENET の送受信ブリッジ
+
+GENET受信は、Pi4で物理IRQ配線差異の影響を受けにくくするため、ゲストWFIトラップ時ポーリングでも取り込みます。
+
+起動ログ例:
+```
+GENET: base=0xFD580000 phy_addr=1 phy_id=XXXX:XXXX
+GENET link is up (phy_link=true mac_link=false)
+```
+
 
 ## ライセンスについて
 本ソフトウェアはApache License, Version 2.0にてライセンスされています。

@@ -3,14 +3,14 @@
 //!
 //! Presents an emulated, legacy Virtio-Net device (2 VirtQueues: RX=0, TX=1)
 //! to the guest. Outgoing packets (TX) are forwarded synchronously to the
-//! physical Virtio-Net device through `crate::VIRTIO_NET`. Incoming packets
-//! (RX) are injected by `push_rx()`, called from the physical Virtio-Net
-//! interrupt handler (see `crate::handle_net_rx`).
+//! active physical backend (`crate::PHYSICAL_NET`) through `send()`.
+//! Incoming packets (RX) are injected by `push_rx()`, called from the physical
+//! backend polling/interrupt path (see `crate::handle_net_rx`).
 //!
 
 use crate::drivers::virtio::*;
 use crate::vm::*;
-use crate::VIRTIO_NET;
+use crate::PHYSICAL_NET;
 
 use core::ptr::{null_mut, read_volatile, write_volatile};
 
@@ -187,6 +187,7 @@ impl VirtioNetMmio {
         self.queues[QUEUE_INDEX_RX]
             .write_used(descriptor_id, (VIRTIO_NET_HDR_SIZE + data.len()) as u32);
         self.interrupt_status |= 1;
+        println!("Virtio-Net RX: delivered {} bytes to guest", data.len());
         get_current_vm()
             .get_gic_distributor_mmio()
             .lock()
@@ -219,9 +220,22 @@ impl VirtioNetMmio {
             if let Some(address) =
                 get_current_vm().get_physical_address(data_descriptor.address as usize)
             {
-                let mut net = VIRTIO_NET.lock();
+                let mut net = PHYSICAL_NET.lock();
                 if let Some(net) = net.as_mut() {
-                    let _ = net.send(address, data_descriptor.length as usize);
+                    match net.send(address, data_descriptor.length as usize) {
+                        Ok(()) => {
+                            println!(
+                                "Virtio-Net TX: sent {} bytes",
+                                data_descriptor.length
+                            );
+                        }
+                        Err(()) => {
+                            println!(
+                                "Virtio-Net TX: physical send() failed ({} bytes)",
+                                data_descriptor.length
+                            );
+                        }
+                    }
                 }
             } else {
                 println!("Failed to translate the Virtio-Net TX buffer address");
