@@ -13,6 +13,10 @@ use core::ptr::{copy_nonoverlapping, read_volatile, write_volatile};
 /* Register definitions (derived from U-Boot/Linux bcmgenet drivers) */
 const SYS_PORT_CTRL: usize = 0x0004;
 const SYS_RBUF_FLUSH_CTRL: usize = 0x0008;
+/* Undocumented soft-reset bit within SYS_RBUF_FLUSH_CTRL, toggled by both
+ * Linux's bcmgenet_umac_reset() and U-Boot's bcmgenet_umac_reset() to pulse
+ * the UniMAC/RXBUF clock domain out of reset before touching UMAC_CMD. */
+const RBUF_FLUSH_RESET: u32 = 1 << 1;
 const PORT_MODE_EXT_GPHY: u32 = 3;
 
 const GENET_EXT_OFF: usize = 0x0080;
@@ -468,9 +472,30 @@ impl Genet {
 
     fn umac_reset(&self) {
         self.write_register(SYS_PORT_CTRL, PORT_MODE_EXT_GPHY);
+
+        /* Pulse the RBUF/UniMAC clock domain out of reset, exactly as
+         * Linux's bcmgenet_umac_reset()/U-Boot's bcmgenet_umac_reset() do.
+         * On real BCM2711 silicon this is not optional bookkeeping: without
+         * first toggling this bit (and waiting the required ~10us each way
+         * for the internal reset synchronizer to settle), the subsequent
+         * UMAC_CMD soft-reset below is issued while the clock domain is
+         * still held in reset and is silently ineffective, leaving the
+         * UniMAC in an unusable state -- the RX/TX DMA path never comes up
+         * even though QEMU's software model (which doesn't care about this
+         * timing) works fine. See also the analogous SDHCI register-write
+         * spacing workaround in drivers/sdhci.rs for the same class of
+         * BCM2711 hardware quirk. */
+        let flush_ctrl = self.read_register(SYS_RBUF_FLUSH_CTRL);
+        self.write_register(SYS_RBUF_FLUSH_CTRL, flush_ctrl | RBUF_FLUSH_RESET);
+        self.delay_us(10);
+        self.write_register(SYS_RBUF_FLUSH_CTRL, flush_ctrl & !RBUF_FLUSH_RESET);
+        self.delay_us(10);
         self.write_register(SYS_RBUF_FLUSH_CTRL, 0);
+        self.delay_us(10);
+
         self.write_register(UMAC_CMD, 0);
         self.write_register(UMAC_CMD, CMD_SW_RESET | CMD_LCL_LOOP_EN);
+        self.delay_us(2);
         self.write_register(UMAC_CMD, 0);
         self.write_register(UMAC_MIB_CTRL, MIB_RESET_RX | MIB_RESET_TX | MIB_RESET_RUNT);
         self.write_register(UMAC_MIB_CTRL, 0);
@@ -514,6 +539,7 @@ impl Genet {
         let rdma_ctrl = self.read_register(RDMA_REG_BASE + DMA_CTRL) & !DMA_EN;
         self.write_register(RDMA_REG_BASE + DMA_CTRL, rdma_ctrl);
         self.write_register(UMAC_TX_FLUSH, 1);
+        self.delay_us(10);
         self.write_register(UMAC_TX_FLUSH, 0);
     }
 
@@ -635,6 +661,23 @@ impl Genet {
             descriptor_base + DMA_DESC_ADDRESS_HI,
             ((address as u64 >> 32) & 0xFFFF_FFFF) as u32,
         );
+    }
+
+    /// Busy-waits for at least `us` microseconds using the generic timer.
+    /// Required by several GENET register-toggle sequences (e.g.
+    /// umac_reset()'s SYS_RBUF_FLUSH_CTRL/UMAC_CMD pulses) so the internal
+    /// reset synchronizer has time to settle on real hardware; see
+    /// drivers/sdhci.rs's `delay_us` for the analogous BCM2711 quirk.
+    fn delay_us(&self, us: u64) {
+        let frequency = asm::get_cntfrq_el0();
+        if frequency == 0 {
+            return;
+        }
+        let ticks = (us * frequency).div_ceil(1_000_000);
+        let start = asm::get_cntpct_el0();
+        while asm::get_cntpct_el0().wrapping_sub(start) < ticks {
+            core::hint::spin_loop();
+        }
     }
 
     fn read_register(&self, offset: usize) -> u32 {
