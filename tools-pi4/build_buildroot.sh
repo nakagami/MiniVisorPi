@@ -27,6 +27,13 @@ make raspberrypi4_64_defconfig
 # scripts/virt.dts). Merge in the virtio options so the guest kernel can
 # find /dev/vda; without this it panics at root-mount time.
 ./utils/config --set-str BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES "$BASE_DIR/tools-pi4/linux-virtio.fragment"
+
+# Real Pi4 hardware may boot with no Ethernet cable plugged in. The default
+# S40network script runs `ifup -a` (and thus `udhcpc`) synchronously, which
+# retries DHCPDISCOVER forever and blocks the rest of boot (including the
+# login prompt) when there is no link. Override it to background `ifup -a`
+# so boot always proceeds regardless of cable/link state.
+./utils/config --set-str BR2_ROOTFS_OVERLAY "$BASE_DIR/tools-pi4/rootfs-overlay"
 make olddefconfig
 
 make -j$(nproc) || exit $?
