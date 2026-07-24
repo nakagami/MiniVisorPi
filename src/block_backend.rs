@@ -2,19 +2,21 @@
 //! Runtime-selected physical block-storage backend
 //!
 //! Wraps whichever concrete storage driver was detected on the DTB (Virtio,
-//! present on QEMU's `virt` machine, or SDHCI, present on e.g. physical
-//! Raspberry Pi 4) behind a single [`BlockDevice`] implementation, so the
+//! present on QEMU's `virt` machine; SDHCI, present on e.g. physical
+//! Raspberry Pi 4; or USB mass storage behind the Pi 4's VL805 xHCI
+//! controller) behind a single [`BlockDevice`] implementation, so the
 //! rest of the hypervisor (FAT32 layer, guest-facing Virtio-Blk MMIO device)
 //! does not need to know which one is actually in use.
 //!
 
 use crate::drivers::block_device::BlockDevice;
-use crate::drivers::{sdhci, virtio_blk};
+use crate::drivers::{sdhci, usb_mass_storage, virtio_blk};
 
 pub enum BlockBackend {
     Invalid,
     Virtio(virtio_blk::VirtioBlk),
     Sdhci(sdhci::Sdhci),
+    Usb(usb_mass_storage::UsbMassStorage),
 }
 
 impl BlockBackend {
@@ -29,6 +31,7 @@ impl BlockDevice for BlockBackend {
             Self::Invalid => Err(()),
             Self::Virtio(blk) => blk.read(buffer_address, block_address, length),
             Self::Sdhci(blk) => blk.read(buffer_address, block_address, length),
+            Self::Usb(blk) => blk.read(buffer_address, block_address, length),
         }
     }
 
@@ -37,6 +40,7 @@ impl BlockDevice for BlockBackend {
             Self::Invalid => Err(()),
             Self::Virtio(blk) => blk.write(buffer_address, block_address, length),
             Self::Sdhci(blk) => blk.write(buffer_address, block_address, length),
+            Self::Usb(blk) => blk.write(buffer_address, block_address, length),
         }
     }
 }

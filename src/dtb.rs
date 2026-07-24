@@ -30,6 +30,16 @@ pub struct DtbProperty {
     len: u32,
 }
 
+impl DtbNode {
+    pub const fn address_cells(&self) -> u32 {
+        self.address_cells
+    }
+
+    pub const fn size_cells(&self) -> u32 {
+        self.size_cells
+    }
+}
+
 impl Dtb {
     const MAGIC: u32 = 0xd00dfeed;
     const VERSION: u32 = 17;

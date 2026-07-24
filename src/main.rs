@@ -14,9 +14,12 @@ mod drivers {
     pub mod generic_timer;
     pub mod genet;
     pub mod gicv2;
+    pub mod pcie_brcm;
     pub mod pl011;
     pub mod sdhci;
+    pub mod usb_mass_storage;
     pub mod virtio;
+    pub mod xhci;
     pub mod virtio_blk;
     pub mod virtio_net;
 }
@@ -38,7 +41,7 @@ mod vgic;
 mod vm;
 
 use block_backend::BlockBackend;
-use drivers::{generic_timer, genet, gicv2, pl011, virtio_blk, virtio_net};
+use drivers::{generic_timer, genet, gicv2, pcie_brcm, pl011, usb_mass_storage, virtio_blk, virtio_net, xhci};
 use lock::Mutex;
 use psci::PsciErrorCodes;
 use serial::SerialDevice;
@@ -181,14 +184,16 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
 
     /* Prefer a Virtio-Blk device (QEMU's `virt` machine); fall back to a
      * physical SDHCI controller (e.g. Raspberry Pi 4's onboard microSD
-     * slot) when no virtio hardware is present. If neither is found,
+     * slot), then to USB mass storage behind the Pi 4's VL805 xHCI
+     * controller, when no earlier backend is present. If none are found,
      * report this clearly instead of panicking, so that console/GIC/UART/
      * SMP bring-up can still be verified on such platforms. */
     let Some(mut virtblk) = init_virtio_blk(&dtb)
         .map(BlockBackend::Virtio)
         .or_else(|| init_sdhci(&dtb).map(BlockBackend::Sdhci))
+        .or_else(|| init_usb_storage(&dtb).map(BlockBackend::Usb))
     else {
-        println!("No supported block-storage device (Virtio-Blk/SDHCI) was found.");
+        println!("No supported block-storage device (Virtio-Blk/SDHCI/USB storage) was found.");
         println!("Guest storage/boot is not supported on this platform yet.");
         loop {
             core::hint::spin_loop();
@@ -585,6 +590,53 @@ fn init_sdhci(dtb: &dtb::Dtb) -> Option<drivers::sdhci::Sdhci> {
         }
     }
     None
+}
+
+/// Searches the DTB for Raspberry Pi 4's PCIe root complex
+/// (`compatible = "brcm,bcm2711-pcie"`) and, if present and operational,
+/// initializes the already-enumerated downstream VL805 xHCI controller and
+/// probes a directly attached USB mass-storage device. Failures are reported
+/// and returned as `None` so SDHCI/Virtio fallback remains available.
+fn init_usb_storage(dtb: &dtb::Dtb) -> Option<usb_mass_storage::UsbMassStorage> {
+    let Some(node) = dtb.search_node_by_compatible(b"brcm,bcm2711-pcie", None) else {
+        println!("PCIe root complex is not present.");
+        return None;
+    };
+    if !dtb.is_node_operational(&node) {
+        println!("PCIe root complex is disabled in the DTB.");
+        return None;
+    }
+    let Ok(pcie) = pcie_brcm::PcieBrcm::new(dtb, &node) else {
+        println!("Failed to initialize the PCIe root complex.");
+        return None;
+    };
+    if !pcie.is_link_up() {
+        println!("PCIe link is down.");
+        return None;
+    }
+    let Some(xhci_pci) = pcie.find_xhci_device() else {
+        println!("No downstream xHCI PCI device was found.");
+        return None;
+    };
+    println!(
+        "PCIe xHCI device {:04X}:{:04X} at CPU MMIO {:#X}",
+        xhci_pci.vendor_id, xhci_pci.device_id, xhci_pci.cpu_mmio_base
+    );
+    let Ok(xhci) = xhci::Xhci::new(xhci_pci.cpu_mmio_base) else {
+        println!("Failed to initialize the xHCI controller.");
+        return None;
+    };
+    let Ok(device) = xhci.probe_mass_storage() else {
+        println!("No USB mass-storage device was found on xHCI.");
+        return None;
+    };
+    match usb_mass_storage::UsbMassStorage::new(device) {
+        Ok(storage) => Some(storage),
+        Err(()) => {
+            println!("Failed to initialize the USB mass-storage device.");
+            None
+        }
+    }
 }
 
 /// Default MAC address used when the physical Virtio-Net device does not
