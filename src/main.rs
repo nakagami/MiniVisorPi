@@ -902,6 +902,18 @@ extern "C" fn core_main() -> ! {
     vm::boot_vm(boot_address, argument)
 }
 
+/// Services the physical PL011 after its interrupt was signalled. Acknowledges the
+/// UART's RX/RX-timeout interrupt *before* draining the FIFO: the reverse order
+/// would silently drop a byte that arrives between the last `getc` and the
+/// acknowledge, since the clear would then wipe the interrupt raised for a byte
+/// still sitting unread in the FIFO. Clearing first can at worst leave the line
+/// re-asserted for a byte this drain already consumed, which merely costs one
+/// extra interrupt that finds the FIFO empty.
+fn handle_uart_interrupt() {
+    PL011_DEVICE.lock().clear_rx_interrupt();
+    handle_input(&PL011_DEVICE);
+}
+
 fn handle_input(device: &Mutex<dyn SerialDevice>) {
     loop {
         let c = device.lock().getc();

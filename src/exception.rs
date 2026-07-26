@@ -265,7 +265,7 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
 /// 2) when using the GENET backend, poll physical RX and inject to guest virtio-net
 /// Then advance past WFI so the guest re-evaluates its wait condition.
 fn wfx_handler() {
-    crate::handle_input(&crate::PL011_DEVICE);
+    crate::handle_uart_interrupt();
     if crate::needs_net_polling_on_wfx() {
         crate::handle_net_rx();
     }
@@ -282,7 +282,7 @@ fn wfx_handler() {
 extern "C" fn fiq_handler() {
     let interrupt_number = GicCpuInterface::get_acknowledge_group0();
     if interrupt_number == unsafe { crate::PL011_INT_ID } {
-        crate::handle_input(&crate::PL011_DEVICE);
+        crate::handle_uart_interrupt();
     } else if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
         println!("Unhandled physical FIQ (Group 0): {interrupt_number}");
     }
@@ -345,7 +345,7 @@ extern "C" fn irq_handler() {
     let (interrupt_number, group) = GicCpuInterface::get_acknowledge();
     let mut deactivate = true;
     if interrupt_number == unsafe { crate::PL011_INT_ID } {
-        crate::handle_input(&crate::PL011_DEVICE);
+        crate::handle_uart_interrupt();
     } else if interrupt_number == vgic::MAINTENANCE_INTERRUPT_INTID {
         vgic::maintenance_interrupt_handler();
     } else if interrupt_number == gicv2::INJECT_INTERRUPT_INT_ID {
