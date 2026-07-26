@@ -146,7 +146,20 @@ fn get_dcache_line_size() -> usize {
     4usize << ((ctr_el0 >> 16) & 0xF)
 }
 
-/// Cleans the D-cache for `[address, address + size)`.
+/// Cleans the D-cache for `[address, address + size)` to the Point of
+/// Coherency.
+///
+/// The trailing barrier is `dsb sy` (full system), NOT `dsb ish` (inner
+/// shareable), because this routine is used to make CPU writes visible to an
+/// external, non-I/O-coherent DMA master -- the Raspberry Pi 4's VL805 xHCI
+/// controller reached over PCIe. That master lives outside the CPU's inner
+/// shareable domain, so an `dsb ish` may return before the cleaned lines have
+/// actually drained through the interconnect to the Point of Coherency that
+/// the PCIe master observes. Using `dsb ish` here caused the controller to
+/// DMA-read stale/garbage command-ring, DCBAA and ERST contents, raising a
+/// Host System Error (USBSTS.HSE) as soon as the first doorbell was rung.
+/// Both U-Boot (`__asm_flush_dcache_range`) and Linux (`dcache_clean_poc`)
+/// use `dsb sy` for exactly this reason.
 pub unsafe fn clean_dcache_range(address: usize, size: usize) {
     let line_size = get_dcache_line_size();
     let mut addr = address & !(line_size - 1);
@@ -155,10 +168,16 @@ pub unsafe fn clean_dcache_range(address: usize, size: usize) {
         unsafe { asm!("dc cvac, {}", in(reg) addr) };
         addr += line_size;
     }
-    unsafe { asm!("dsb ish") };
+    unsafe { asm!("dsb sy") };
 }
 
-/// Invalidates the D-cache for `[address, address + size)`.
+/// Invalidates the D-cache for `[address, address + size)` to the Point of
+/// Coherency.
+///
+/// Uses `dsb sy` (full system) rather than `dsb ish` for the same reason as
+/// [`clean_dcache_range`]: this is used to discard stale CPU cache lines
+/// before reading data produced by the external PCIe DMA master, which is not
+/// part of the inner shareable domain.
 pub unsafe fn invalidate_dcache_range(address: usize, size: usize) {
     let line_size = get_dcache_line_size();
     let mut addr = address & !(line_size - 1);
@@ -167,7 +186,7 @@ pub unsafe fn invalidate_dcache_range(address: usize, size: usize) {
         unsafe { asm!("dc ivac, {}", in(reg) addr) };
         addr += line_size;
     }
-    unsafe { asm!("dsb ish") };
+    unsafe { asm!("dsb sy") };
 }
 
 /// Clean the D-cache to the point of unification and invalidate the
