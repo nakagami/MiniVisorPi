@@ -24,6 +24,24 @@ use crate::asm;
 use core::cmp::min;
 use core::mem::size_of;
 use core::ptr::{copy_nonoverlapping, read_volatile, write_bytes, write_volatile};
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// CPU-physical → PCIe-bus address offset for downstream DMA masters.
+///
+/// On the BCM2711 the PCIe inbound window is not identity-mapped: the VL805
+/// xHCI controller sees system RAM at `cpu_phys + DMA_OFFSET` (observed
+/// 0x4_00000000). Every address handed to the controller — pointer registers,
+/// the DCBAA/ERST/scratchpad structures, TRB ring link pointers, endpoint
+/// context dequeue pointers and transfer data buffers — must therefore be
+/// translated with [`to_bus`], while CPU-side accesses keep using the raw
+/// physical address. The value is read from the PCIe root complex at init.
+static DMA_OFFSET: AtomicU64 = AtomicU64::new(0);
+
+/// Translates a CPU physical address into the PCIe bus address the xHCI
+/// controller must be programmed with. See [`DMA_OFFSET`].
+fn to_bus(cpu_addr: usize) -> u64 {
+    cpu_addr as u64 + DMA_OFFSET.load(Ordering::Relaxed)
+}
 
 const MAX_HC_SLOTS: usize = 256;
 const MAX_EP_CTX_NUM: usize = 31;
@@ -32,10 +50,13 @@ const LINK_TRB_INDEX: usize = TRBS_PER_SEGMENT - 1;
 const POLL_TIMEOUT_US: u64 = 5_000_000;
 const RESET_TIMEOUT_US: u64 = 250_000;
 const HALT_TIMEOUT_US: u64 = 16_000;
+const HUB_SHORT_RESET_DELAY_US: u64 = 20_000;
+const HUB_LONG_RESET_DELAY_US: u64 = 200_000;
 
 const USBCMD_RUN: u32 = 1 << 0;
 const USBCMD_RESET: u32 = 1 << 1;
 const USBSTS_HALT: u32 = 1 << 0;
+const USBSTS_HSE: u32 = 1 << 2;
 const USBSTS_CNR: u32 = 1 << 11;
 
 const CONFIG_MAX_SLOTS_MASK: u32 = 0xFF;
@@ -77,10 +98,13 @@ const SLOT_SPEED_FS: u32 = XDEV_FS << 10;
 const SLOT_SPEED_LS: u32 = XDEV_LS << 10;
 const SLOT_SPEED_HS: u32 = XDEV_HS << 10;
 const SLOT_SPEED_SS: u32 = XDEV_SS << 10;
+const DEV_MTT: u32 = 1 << 25;
+const DEV_HUB: u32 = 1 << 26;
 const LAST_CTX_SHIFT: u32 = 27;
 const SLOT_FLAG: u32 = 1 << 0;
 const EP0_FLAG: u32 = 1 << 1;
 const ROOT_HUB_PORT_SHIFT: u32 = 16;
+const MAX_PORTS_SHIFT: u32 = 24;
 
 const EP_TYPE_SHIFT: u32 = 3;
 const CTRL_EP: u32 = 4;
@@ -115,16 +139,45 @@ const TRB_LINK: u32 = 6;
 const COMP_SUCCESS: u32 = 1;
 const COMP_SHORT_TX: u32 = 13;
 
+const TT_PORT_SHIFT: u32 = 8;
+const TT_THINK_TIME_SHIFT: u32 = 16;
+
+const USB_REQ_GET_STATUS: u8 = 0;
+const USB_REQ_CLEAR_FEATURE: u8 = 1;
+const USB_REQ_SET_FEATURE: u8 = 3;
 const USB_REQ_GET_DESCRIPTOR: u8 = 6;
 const USB_REQ_SET_CONFIGURATION: u8 = 9;
+const USB_REQ_SET_INTERFACE: u8 = 11;
 const USB_DIR_IN: u8 = 0x80;
+const USB_RT_HUB: u8 = 0x20;
+const USB_RT_PORT: u8 = 0x23;
+const USB_RECIP_INTERFACE: u8 = 0x01;
+const USB_CLASS_HUB: u8 = 0x09;
 const USB_DT_DEVICE: u8 = 1;
 const USB_DT_CONFIG: u8 = 2;
 const USB_DT_INTERFACE: u8 = 4;
 const USB_DT_ENDPOINT: u8 = 5;
+const USB_DT_HUB: u8 = 0x29;
+const USB_DT_SS_HUB: u8 = 0x2A;
 const USB_DT_SS_EP_COMPANION: u8 = 0x30;
 const USB_ENDPOINT_XFER_BULK: u8 = 2;
 const USB_ENDPOINT_DIR_MASK: u8 = 0x80;
+const USB_PORT_FEAT_RESET: u16 = 4;
+const USB_PORT_FEAT_POWER: u16 = 8;
+const USB_PORT_FEAT_C_RESET: u16 = 20;
+const USB_PORT_STAT_CONNECTION: u16 = 0x0001;
+const USB_PORT_STAT_ENABLE: u16 = 0x0002;
+const USB_PORT_STAT_RESET: u16 = 0x0010;
+const USB_PORT_STAT_LOW_SPEED: u16 = 0x0200;
+const USB_PORT_STAT_HIGH_SPEED: u16 = 0x0400;
+const USB_PORT_STAT_SUPER_SPEED: u16 = 0x0600;
+const USB_PORT_STAT_SPEED_MASK: u16 = USB_PORT_STAT_LOW_SPEED | USB_PORT_STAT_HIGH_SPEED;
+const USB_PORT_STAT_C_RESET: u16 = 0x0010;
+const HUB_CHAR_LPSM: u16 = 0x0003;
+const HUB_CHAR_INDV_PORT_LPSM: u16 = 0x0001;
+const HUB_CHAR_TTTT: u16 = 0x0060;
+const HUB_CHAR_TTTT_SHIFT: u32 = 5;
+const USB_HUB_PR_HS_MULTI_TT: u8 = 2;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum UsbSpeed {
@@ -173,8 +226,12 @@ pub struct Xhci {
 
 struct XhciDevice {
     slot_id: u8,
-    port_id: u8,
+    root_hub_port: u8,
     speed: UsbSpeed,
+    route_string: u32,
+    tt_hub_slot_id: u8,
+    tt_port_number: u8,
+    multi_tt: bool,
     ep0_max_packet: u16,
     out_ctx: DmaRegion,
     in_ctx: DmaRegion,
@@ -209,6 +266,29 @@ struct MassStorageConfiguration {
     max_burst_in: u8,
     max_burst_out: u8,
     max_ep_index: usize,
+}
+
+/// A fully configured mass-storage device found during the root-port scan,
+/// carried out of the (borrowing) probe helpers so that the controller itself
+/// can be moved into [`XhciMassStorageDevice`] afterwards.
+struct ProbedMassStorage {
+    device: XhciDevice,
+    config: MassStorageConfiguration,
+    bulk_out_index: usize,
+    bulk_in_index: usize,
+}
+
+struct HubDescriptor {
+    num_ports: u8,
+    power_on_to_good_ms: u16,
+    tt_think_time: u8,
+    multi_tt: bool,
+}
+
+#[derive(Clone, Copy)]
+struct HubPortStatus {
+    status: u16,
+    change: u16,
 }
 
 #[repr(C)]
@@ -287,15 +367,18 @@ impl XhciMassStorageDevice {
 }
 
 impl Xhci {
-    pub fn new(base_address: usize) -> Result<Self, ()> {
+    pub fn new(base_address: usize, dma_offset: u64) -> Result<Self, ()> {
+        DMA_OFFSET.store(dma_offset, Ordering::Relaxed);
         let capbase = Self::read32(base_address);
         let hcsparams1 = Self::read32(base_address + 0x04);
         let hcsparams2 = Self::read32(base_address + 0x08);
         let hccparams = Self::read32(base_address + 0x10);
         let capability_length = (capbase & 0xFF) as usize;
         let operational_base = base_address + capability_length;
-        let doorbell_base = base_address + ((Self::read32(base_address + 0x14) & DBOFF_MASK) as usize);
-        let runtime_base = base_address + ((Self::read32(base_address + 0x18) & RTSOFF_MASK) as usize);
+        let doorbell_base =
+            base_address + ((Self::read32(base_address + 0x14) & DBOFF_MASK) as usize);
+        let runtime_base =
+            base_address + ((Self::read32(base_address + 0x18) & RTSOFF_MASK) as usize);
         let hci_version = (capbase >> 16) as u16;
 
         let page_size_bits = Self::read32(operational_base + 0x08) & 0xFFFF;
@@ -312,10 +395,18 @@ impl Xhci {
         };
         let page_size = 1usize << page_shift;
 
-        let dcbaa = DmaRegion::new(size_of::<u64>() * MAX_HC_SLOTS, 12)?;
-        let command_ring = TrbRing::new(true)?;
-        let event_ring = EventRing::new()?;
-        let erst = DmaRegion::new(size_of::<ErstEntry>(), 12)?;
+        let dcbaa = DmaRegion::new(size_of::<u64>() * MAX_HC_SLOTS, 12).map_err(|_| {
+            println!("xHCI: failed to allocate the Device Context Base Address Array");
+        })?;
+        let command_ring = TrbRing::new(true).map_err(|_| {
+            println!("xHCI: failed to allocate the command ring");
+        })?;
+        let event_ring = EventRing::new().map_err(|_| {
+            println!("xHCI: failed to allocate the event ring");
+        })?;
+        let erst = DmaRegion::new(size_of::<ErstEntry>(), 12).map_err(|_| {
+            println!("xHCI: failed to allocate the Event Ring Segment Table");
+        })?;
 
         let mut controller = Self {
             operational_base,
@@ -334,23 +425,242 @@ impl Xhci {
             scratchpad_buffers: None,
         };
 
-        controller.reset_controller()?;
-        controller.program_max_slots();
-        controller.initialize_memory_structures()?;
-        controller.start_controller()?;
-        println!("USB XHCI {}.{:02X}", controller.hci_version >> 8, controller.hci_version & 0xFF);
+        controller.bring_up().map_err(|_| {
+            println!("xHCI: controller bring-up failed after retries");
+        })?;
+        println!(
+            "USB XHCI {}.{:02X}",
+            controller.hci_version >> 8,
+            controller.hci_version & 0xFF
+        );
         Ok(controller)
     }
 
+    /// Runs the reset/program/start sequence, retrying a few times on
+    /// failure. Real Raspberry Pi 4 hardware has been observed to
+    /// occasionally raise a Host System Error (USBSTS.HSE) or fail to leave
+    /// the halted state on the very first attempt, likely a marginal timing
+    /// issue in the VL805/PCIe bring-up rather than a deterministic driver
+    /// bug (the exact same code path succeeds on other boots without
+    /// change). A full HC reset clears that error state, so simply retrying
+    /// the whole sequence a few times is a pragmatic way to ride out that
+    /// flakiness instead of failing outright on the first bad attempt.
+    fn bring_up(&mut self) -> Result<(), ()> {
+        const MAX_ATTEMPTS: u32 = 4;
+        for attempt in 1..=MAX_ATTEMPTS {
+            /* Clear any stale RW1C status bits (Host System Error, Event
+             * Interrupt, Port Change Detect, Save/Restore Error) left over
+             * from a previous failed attempt before trying again. */
+            self.write_operational32(0x04, self.read_operational32(0x04));
+
+            let result = (|| -> Result<(), ()> {
+                self.reset_controller()
+                    .map_err(|_| println!("xHCI:   reset_controller failed"))?;
+                self.program_max_slots();
+                self.initialize_memory_structures()
+                    .map_err(|_| println!("xHCI:   initialize_memory_structures failed"))?;
+                self.start_controller()
+                    .map_err(|_| println!("xHCI:   start_controller failed"))
+            })();
+
+            match result {
+                Ok(()) => return Ok(()),
+                Err(()) => {
+                    if attempt == MAX_ATTEMPTS {
+                        return Err(());
+                    }
+                    println!(
+                        "xHCI: bring-up attempt {attempt}/{MAX_ATTEMPTS} failed (USBSTS={:#X}), retrying",
+                        self.read_operational32(0x04)
+                    );
+                    Self::delay_ms(50);
+                }
+            }
+        }
+        Err(())
+    }
+
     pub fn probe_mass_storage(mut self) -> Result<XhciMassStorageDevice, ()> {
-        let (port_id, speed) = self.find_and_reset_connected_port()?;
+        let max_ports = ((self.hcsparams1 >> HCS_MAX_PORTS_SHIFT) & HCS_MAX_PORTS_MASK) as usize;
+        let power_control = (self.hccparams & HCC_PPC) != 0;
+        println!(
+            "xHCI: scanning {} root port(s) (port power control: {})",
+            max_ports, power_control
+        );
+
+        /*
+         * Every root port must be tried, not just the first one that reports a
+         * connection: the Raspberry Pi 4's VL805 exposes its onboard VIA Labs
+         * hub twice -- as a USB 2.0 hub on a High-Speed root port and as a USB
+         * 3.0 hub on a SuperSpeed root port -- and each physical socket is
+         * routed to whichever of the two matches the speed the attached device
+         * negotiated. A SuperSpeed stick therefore leaves all downstream ports
+         * of the High-Speed hub (which sits on the lowest-numbered root port,
+         * and so is scanned first) reporting "no connection", so stopping
+         * there would never reach the hub that actually has the device.
+         */
+        let mut found = None;
+        for port in 1..=max_ports {
+            let port = port as u8;
+            let Some(speed) = self.reset_root_port(port, power_control) else {
+                continue;
+            };
+            match self.probe_root_port_device(port, speed) {
+                Ok(probed) => {
+                    found = Some(probed);
+                    break;
+                }
+                Err(()) => println!(
+                    "xHCI: no usable mass-storage device behind root port {port}, \
+                     continuing the scan"
+                ),
+            }
+        }
+        let Some(probed) = found else {
+            println!("xHCI: no USB mass-storage device was found on any root port");
+            return Err(());
+        };
+
+        Ok(XhciMassStorageDevice {
+            controller: self,
+            device: probed.device,
+            bulk_in_ep: probed.config.bulk_in_ep,
+            bulk_out_ep: probed.config.bulk_out_ep,
+            bulk_in_index: probed.bulk_in_index,
+            bulk_out_index: probed.bulk_out_index,
+            max_packet_in: probed.config.max_packet_in,
+            max_packet_out: probed.config.max_packet_out,
+        })
+    }
+
+    /// Addresses the device sitting on an already-reset root port and, if it
+    /// turns out to be a hub, walks that hub's downstream ports looking for a
+    /// mass-storage device.
+    fn probe_root_port_device(
+        &mut self,
+        port_id: u8,
+        speed: UsbSpeed,
+    ) -> Result<ProbedMassStorage, ()> {
         let slot_id = self.enable_slot()?;
-        let mut device = self.allocate_device(slot_id, port_id, speed)?;
+        println!("xHCI: enabled slot {slot_id} for root port {port_id}");
+        let mut device = self.allocate_device(slot_id, port_id, speed, 0, 0, 0, false)?;
         self.address_device(&mut device)?;
+        println!("xHCI: addressed device on slot {slot_id}");
 
         let mut device_descriptor = [0u8; 18];
         self.get_descriptor(&mut device, USB_DT_DEVICE, 0, &mut device_descriptor)?;
+        println!(
+            "xHCI: device descriptor: class {:#04X} vendor {:04X}:{:04X}",
+            device_descriptor[4],
+            u16::from_le_bytes([device_descriptor[8], device_descriptor[9]]),
+            u16::from_le_bytes([device_descriptor[10], device_descriptor[11]])
+        );
 
+        if device_descriptor[4] != USB_CLASS_HUB {
+            return self.configure_mass_storage_device(device, speed);
+        }
+
+        println!(
+            "xHCI: root port {} has a {} hub attached (protocol {})",
+            port_id,
+            Self::speed_name(speed),
+            device_descriptor[6]
+        );
+        let hub = self.configure_hub_device(&mut device, &device_descriptor)?;
+        self.probe_hub_downstream_ports(&mut device, &hub, port_id)
+    }
+
+    /// Tries every downstream port of `hub_device` in turn, so that a hub port
+    /// holding a non-storage device (or a nested hub, which this driver does
+    /// not traverse) does not hide a mass-storage device on a later port.
+    fn probe_hub_downstream_ports(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        hub: &HubDescriptor,
+        port_id: u8,
+    ) -> Result<ProbedMassStorage, ()> {
+        for downstream_port in 1..=hub.num_ports {
+            let Some(downstream_speed) = self.reset_hub_downstream_port(hub_device, downstream_port)
+            else {
+                continue;
+            };
+            println!(
+                "xHCI: hub downstream port {} has a {} device attached",
+                downstream_port,
+                Self::speed_name(downstream_speed)
+            );
+            match self.probe_hub_downstream_device(
+                hub_device,
+                hub,
+                port_id,
+                downstream_port,
+                downstream_speed,
+            ) {
+                Ok(probed) => return Ok(probed),
+                Err(()) => println!(
+                    "xHCI: no usable mass-storage device on hub downstream port \
+                     {downstream_port}, continuing the scan"
+                ),
+            }
+        }
+        println!("xHCI: no usable downstream device found behind the hub on root port {port_id}");
+        Err(())
+    }
+
+    fn probe_hub_downstream_device(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        hub: &HubDescriptor,
+        port_id: u8,
+        downstream_port: u8,
+        downstream_speed: UsbSpeed,
+    ) -> Result<ProbedMassStorage, ()> {
+        let child_slot_id = self.enable_slot()?;
+        /* This driver only supports a single hub tier, so the route string is
+         * just the hub port encoded in the low nibble. Deeper hub chains would
+         * need to accumulate one 4-bit hop per level. */
+        let route_string = min(downstream_port, 15) as u32;
+        let (tt_hub_slot_id, tt_port_number, multi_tt) =
+            if matches!(downstream_speed, UsbSpeed::Low | UsbSpeed::Full)
+                && hub_device.speed == UsbSpeed::High
+            {
+                (hub_device.slot_id, downstream_port, hub.multi_tt)
+            } else {
+                (0, 0, false)
+            };
+        let mut downstream = self.allocate_device(
+            child_slot_id,
+            port_id,
+            downstream_speed,
+            route_string,
+            tt_hub_slot_id,
+            tt_port_number,
+            multi_tt,
+        )?;
+        self.address_device(&mut downstream)?;
+        let mut device_descriptor = [0u8; 18];
+        self.get_descriptor(&mut downstream, USB_DT_DEVICE, 0, &mut device_descriptor)?;
+        println!(
+            "xHCI: downstream device descriptor: class {:#04X} vendor {:04X}:{:04X}",
+            device_descriptor[4],
+            u16::from_le_bytes([device_descriptor[8], device_descriptor[9]]),
+            u16::from_le_bytes([device_descriptor[10], device_descriptor[11]])
+        );
+        if device_descriptor[4] == USB_CLASS_HUB {
+            println!("xHCI: only one level of hub traversal is currently supported");
+            return Err(());
+        }
+        self.configure_mass_storage_device(downstream, downstream_speed)
+    }
+
+    /// Reads `device`'s configuration descriptor and, when it exposes a
+    /// Bulk-Only mass-storage interface, selects that configuration and sets
+    /// up its bulk endpoints.
+    fn configure_mass_storage_device(
+        &mut self,
+        mut device: XhciDevice,
+        speed: UsbSpeed,
+    ) -> Result<ProbedMassStorage, ()> {
         let mut config_header = [0u8; 9];
         self.get_descriptor(&mut device, USB_DT_CONFIG, 0, &mut config_header)?;
         let total_length = u16::from_le_bytes([config_header[2], config_header[3]]) as usize;
@@ -367,7 +677,7 @@ impl Xhci {
         )?;
         let configuration_value = configuration[5];
 
-        let Some(mass_storage) =
+        let Some(config) =
             Self::parse_mass_storage_configuration(&configuration[..total_length], speed)
         else {
             println!("xHCI: no USB mass-storage interface found");
@@ -377,24 +687,20 @@ impl Xhci {
         self.set_configuration(&mut device, configuration_value)?;
         let (bulk_out_index, bulk_in_index) = self.configure_mass_storage_endpoints(
             &mut device,
-            mass_storage.bulk_out_ep,
-            mass_storage.bulk_in_ep,
-            mass_storage.max_packet_out,
-            mass_storage.max_packet_in,
-            mass_storage.max_burst_out,
-            mass_storage.max_burst_in,
-            mass_storage.max_ep_index,
+            config.bulk_out_ep,
+            config.bulk_in_ep,
+            config.max_packet_out,
+            config.max_packet_in,
+            config.max_burst_out,
+            config.max_burst_in,
+            config.max_ep_index,
         )?;
 
-        Ok(XhciMassStorageDevice {
-            controller: self,
+        Ok(ProbedMassStorage {
             device,
-            bulk_in_ep: mass_storage.bulk_in_ep,
-            bulk_out_ep: mass_storage.bulk_out_ep,
-            bulk_in_index,
+            config,
             bulk_out_index,
-            max_packet_in: mass_storage.max_packet_in,
-            max_packet_out: mass_storage.max_packet_out,
+            bulk_in_index,
         })
     }
 
@@ -413,8 +719,48 @@ impl Xhci {
     }
 
     fn start_controller(&mut self) -> Result<(), ()> {
+        self.dcbaa.invalidate();
+        if let Some(sp) = self.scratchpad_array.as_ref() {
+            sp.invalidate();
+        }
+        self.erst.invalidate();
+        let dcbaa0 = unsafe { read_volatile(self.dcbaa.address as *const u64) };
+        let sp0 = self
+            .scratchpad_array
+            .as_ref()
+            .map(|r| unsafe { read_volatile(r.address as *const u64) })
+            .unwrap_or(0);
+        let erst_seg = unsafe { read_volatile(self.erst.address as *const u64) };
+        println!(
+            "xHCI: regs DCBAAP={:#X} CRCR={:#X} ERSTBA={:#X} ERDP={:#X} ERSTSZ={:#X}",
+            Self::read64(self.operational_base + 0x30),
+            Self::read64(self.operational_base + 0x18),
+            Self::read64(self.runtime_base + 0x30),
+            Self::read64(self.runtime_base + 0x38),
+            self.read_runtime32(0x28),
+        );
+        println!(
+            "xHCI: ram DCBAA[0]={:#X} SP[0]={:#X} ERST.seg={:#X}",
+            dcbaa0, sp0, erst_seg
+        );
+        println!(
+            "xHCI: pre-start USBSTS={:#X} USBCMD={:#X}",
+            self.read_operational32(0x04),
+            self.read_operational32(0x00)
+        );
         let cmd = self.read_operational32(0x00) | USBCMD_RUN;
         self.write_operational32(0x00, cmd);
+        for _ in 0..10 {
+            Self::delay_ms(1);
+            let sts = self.read_operational32(0x04);
+            if (sts & USBSTS_HSE) != 0 {
+                println!("xHCI: HSE set {:#X} shortly after R/S=1", sts);
+                break;
+            }
+            if (sts & USBSTS_HALT) == 0 {
+                break;
+            }
+        }
         self.wait_operational_bits(0x04, USBSTS_HALT, 0, HALT_TIMEOUT_US)?;
         self.write_runtime32(0x20, 0);
         self.write_runtime32(0x1C, 0);
@@ -432,27 +778,54 @@ impl Xhci {
     fn initialize_memory_structures(&mut self) -> Result<(), ()> {
         unsafe { write_bytes(self.dcbaa.address as *mut u8, 0, self.dcbaa.size) };
         self.dcbaa.clean();
-        self.write_operational64(0x30, self.dcbaa.address as u64);
+        self.write_operational64(0x30, to_bus(self.dcbaa.address));
 
         self.write_operational64(
             0x18,
-            ((self.command_ring.region.address as u64) & !CMD_RING_RSVD_BITS)
+            (to_bus(self.command_ring.region.address) & !CMD_RING_RSVD_BITS)
                 | self.command_ring.cycle_state as u64,
         );
 
         unsafe { write_bytes(self.erst.address as *mut u8, 0, self.erst.size) };
         let erst_entry = unsafe { &mut *(self.erst.address as *mut ErstEntry) };
-        erst_entry.seg_addr = self.event_ring.region.address as u64;
+        erst_entry.seg_addr = to_bus(self.event_ring.region.address);
         erst_entry.seg_size = TRBS_PER_SEGMENT as u32;
         erst_entry.reserved = 0;
         self.erst.clean();
 
-        self.write_runtime64(0x38, (self.event_ring.region.address as u64) & !ERST_PTR_MASK);
+        self.write_runtime64(
+            0x38,
+            to_bus(self.event_ring.region.address) & !ERST_PTR_MASK,
+        );
         self.write_runtime32(0x28, 1);
-        self.write_runtime64(0x30, (self.erst.address as u64) & !ERST_PTR_MASK);
+        self.write_runtime64(0x30, to_bus(self.erst.address) & !ERST_PTR_MASK);
 
         self.allocate_scratchpads()?;
         self.write_operational32(0x14, 0);
+        println!(
+            "xHCI: hcs1={:#X} hcs2={:#X} hcc={:#X} pagesz={:#X} nscratch={}",
+            self.hcsparams1,
+            self.hcsparams2,
+            self.hccparams,
+            self.page_size,
+            (((self.hcsparams2 >> HCS_MAX_SCRATCHPAD_HI_SHIFT) & 0x3E0)
+                | ((self.hcsparams2 >> HCS_MAX_SCRATCHPAD_LO_SHIFT) & 0x1F))
+        );
+        println!(
+            "xHCI: dcbaa={:#X} cmd={:#X} evt={:#X} erst={:#X} sp_arr={:#X} sp_buf={:#X}",
+            self.dcbaa.address,
+            self.command_ring.region.address,
+            self.event_ring.region.address,
+            self.erst.address,
+            self.scratchpad_array
+                .as_ref()
+                .map(|r| r.address)
+                .unwrap_or(0),
+            self.scratchpad_buffers
+                .as_ref()
+                .map(|r| r.address)
+                .unwrap_or(0),
+        );
         Ok(())
     }
 
@@ -465,65 +838,110 @@ impl Xhci {
         }
 
         let scratchpad_array = DmaRegion::new(num_scratchpads * size_of::<u64>(), 12)?;
-        let scratchpad_buffers = DmaRegion::new(num_scratchpads * self.page_size, self.page_size.ilog2() as usize)?;
-        unsafe { write_bytes(scratchpad_array.address as *mut u8, 0, scratchpad_array.size) };
-        unsafe { write_bytes(scratchpad_buffers.address as *mut u8, 0, scratchpad_buffers.size) };
+        let scratchpad_buffers = DmaRegion::new(
+            num_scratchpads * self.page_size,
+            self.page_size.ilog2() as usize,
+        )?;
+        unsafe {
+            write_bytes(
+                scratchpad_array.address as *mut u8,
+                0,
+                scratchpad_array.size,
+            )
+        };
+        unsafe {
+            write_bytes(
+                scratchpad_buffers.address as *mut u8,
+                0,
+                scratchpad_buffers.size,
+            )
+        };
         for i in 0..num_scratchpads {
             unsafe {
                 write_volatile(
                     (scratchpad_array.address as *mut u64).add(i),
-                    (scratchpad_buffers.address + i * self.page_size) as u64,
+                    to_bus(scratchpad_buffers.address + i * self.page_size),
                 )
             };
         }
         scratchpad_buffers.clean();
         scratchpad_array.clean();
-        unsafe { write_volatile(self.dcbaa.address as *mut u64, scratchpad_array.address as u64) };
+        unsafe {
+            write_volatile(
+                self.dcbaa.address as *mut u64,
+                to_bus(scratchpad_array.address),
+            )
+        };
         self.dcbaa.clean();
         self.scratchpad_array = Some(scratchpad_array);
         self.scratchpad_buffers = Some(scratchpad_buffers);
         Ok(())
     }
 
-    fn find_and_reset_connected_port(&mut self) -> Result<(u8, UsbSpeed), ()> {
-        let max_ports = ((self.hcsparams1 >> HCS_MAX_PORTS_SHIFT) & HCS_MAX_PORTS_MASK) as usize;
-        let power_control = (self.hccparams & HCC_PPC) != 0;
-        for port in 1..=max_ports {
-            let mut status = self.read_portsc(port as u8);
-            if power_control && (status & PORT_POWER) == 0 {
-                let neutral = Self::port_state_to_neutral(status) | PORT_POWER;
-                self.write_portsc(port as u8, neutral);
-                status = self.read_portsc(port as u8);
-            }
-            if (status & PORT_CONNECT) == 0 {
-                continue;
-            }
-            self.clear_port_change_bits(port as u8, status);
-            let neutral = Self::port_state_to_neutral(status) | PORT_RESET;
-            self.write_portsc(port as u8, neutral);
-            self.wait_until(
+    /// Powers (if needed) and resets a single root port, returning the
+    /// negotiated speed when a device is present and successfully enabled.
+    /// Returns `None` -- rather than an error -- for an empty or unusable
+    /// port, so that the caller can keep scanning the remaining root ports.
+    fn reset_root_port(&mut self, port: u8, power_control: bool) -> Option<UsbSpeed> {
+        let mut status = self.read_portsc(port);
+        if power_control && (status & PORT_POWER) == 0 {
+            let neutral = Self::port_state_to_neutral(status) | PORT_POWER;
+            self.write_portsc(port, neutral);
+            /*
+             * A port that was just powered on needs time before the
+             * hardware can report a device as connected (xHCI spec 4.19.1
+             * / bPwrOn2PwrGood-style settle time, typically up to tens of
+             * ms). Re-reading PORTSC immediately after the power-on write
+             * risks seeing PORT_CONNECT still clear even though a device
+             * is physically attached, so wait a bit before the very
+             * first read used to decide whether to skip this port.
+             */
+            Self::delay_ms(20);
+            status = self.read_portsc(port);
+        }
+        println!("xHCI: root port {} PORTSC {:#X}", port, status);
+        if (status & PORT_CONNECT) == 0 {
+            return None;
+        }
+        self.clear_port_change_bits(port, status);
+        let neutral = Self::port_state_to_neutral(status) | PORT_RESET;
+        self.write_portsc(port, neutral);
+        if self
+            .wait_until(
                 || {
-                    let value = self.read_portsc(port as u8);
+                    let value = self.read_portsc(port);
                     (value & PORT_RESET) == 0 && (value & PORT_CONNECT) != 0
                 },
                 POLL_TIMEOUT_US,
-            )?;
-            status = self.read_portsc(port as u8);
-            self.clear_port_change_bits(port as u8, status);
-            if (status & PORT_PE) == 0 {
-                println!("xHCI: port {port} did not enable after reset ({status:#X})");
-                continue;
-            }
-            let speed = match status & DEV_SPEED_MASK {
-                XDEV_LS => UsbSpeed::Low,
-                XDEV_FS => UsbSpeed::Full,
-                XDEV_HS => UsbSpeed::High,
-                XDEV_SS => UsbSpeed::Super,
-                _ => continue,
-            };
-            return Ok((port as u8, speed));
+            )
+            .is_err()
+        {
+            println!(
+                "xHCI: root port {} reset timed out (PORTSC {:#X})",
+                port,
+                self.read_portsc(port)
+            );
+            return None;
         }
-        Err(())
+        status = self.read_portsc(port);
+        self.clear_port_change_bits(port, status);
+        if (status & PORT_PE) == 0 {
+            println!("xHCI: port {port} did not enable after reset ({status:#X})");
+            return None;
+        }
+        let speed = match status & DEV_SPEED_MASK {
+            XDEV_LS => UsbSpeed::Low,
+            XDEV_FS => UsbSpeed::Full,
+            XDEV_HS => UsbSpeed::High,
+            XDEV_SS => UsbSpeed::Super,
+            _ => return None,
+        };
+        println!(
+            "xHCI: root port {} enabled, speed {}",
+            port,
+            Self::speed_name(speed)
+        );
+        Some(speed)
     }
 
     fn enable_slot(&mut self) -> Result<u8, ()> {
@@ -539,7 +957,16 @@ impl Xhci {
         Ok(slot_id)
     }
 
-    fn allocate_device(&self, slot_id: u8, port_id: u8, speed: UsbSpeed) -> Result<XhciDevice, ()> {
+    fn allocate_device(
+        &self,
+        slot_id: u8,
+        root_hub_port: u8,
+        speed: UsbSpeed,
+        route_string: u32,
+        tt_hub_slot_id: u8,
+        tt_port_number: u8,
+        multi_tt: bool,
+    ) -> Result<XhciDevice, ()> {
         let out_ctx = DmaRegion::new(self.device_context_size(), 12)?;
         let in_ctx = DmaRegion::new(self.input_context_size(), 12)?;
         let ep0_ring = TrbRing::new(true)?;
@@ -547,12 +974,21 @@ impl Xhci {
         unsafe { write_bytes(in_ctx.address as *mut u8, 0, in_ctx.size) };
         out_ctx.clean();
         in_ctx.clean();
-        unsafe { write_volatile((self.dcbaa.address as *mut u64).add(slot_id as usize), out_ctx.address as u64) };
+        unsafe {
+            write_volatile(
+                (self.dcbaa.address as *mut u64).add(slot_id as usize),
+                to_bus(out_ctx.address),
+            )
+        };
         self.dcbaa.clean();
         Ok(XhciDevice {
             slot_id,
-            port_id,
+            root_hub_port,
             speed,
+            route_string,
+            tt_hub_slot_id,
+            tt_port_number,
+            multi_tt,
             /* USB2 devices may need EP0's size learned from the descriptor, but
              * xHCI already knows the correct default control maxpacket once port
              * speed is known. For SuperSpeed that value is always 512 bytes, so
@@ -580,20 +1016,34 @@ impl Xhci {
         unsafe { write_bytes(device.in_ctx.address as *mut u8, 0, device.in_ctx.size) };
         ctrl_ctx.drop_flags = 0;
         ctrl_ctx.add_flags = SLOT_FLAG | EP0_FLAG;
-        slot_ctx.dev_info = Self::slot_speed_bits(device.speed) | Self::last_ctx(1);
-        slot_ctx.dev_info2 = (device.port_id as u32) << ROOT_HUB_PORT_SHIFT;
-        slot_ctx.tt_info = 0;
+        slot_ctx.dev_info =
+            device.route_string | Self::slot_speed_bits(device.speed) | Self::last_ctx(1);
+        if device.multi_tt {
+            slot_ctx.dev_info |= DEV_MTT;
+        }
+        slot_ctx.dev_info2 = (device.root_hub_port as u32) << ROOT_HUB_PORT_SHIFT;
+        slot_ctx.tt_info = if device.tt_hub_slot_id != 0 {
+            Self::tt_slot(device.tt_hub_slot_id as u32)
+                | Self::tt_port(device.tt_port_number as u32)
+        } else {
+            0
+        };
         slot_ctx.dev_state = 0;
         ep0_ctx.ep_info = 0;
         ep0_ctx.ep_info2 = Self::ep_type(CTRL_EP)
             | Self::max_packet(device.ep0_max_packet)
             | Self::max_burst(0)
             | Self::error_count(3);
-        ep0_ctx.deq = device.ep0_ring.region.address as u64 | device.ep0_ring.cycle_state as u64;
+        ep0_ctx.deq = to_bus(device.ep0_ring.region.address) | device.ep0_ring.cycle_state as u64;
         ep0_ctx.tx_info = 8 & EP_AVG_TRB_LENGTH_MASK;
         device.in_ctx.clean();
 
-        self.queue_command(device.in_ctx.address as u64, device.slot_id, 0, TRB_ADDR_DEV)?;
+        self.queue_command(
+            to_bus(device.in_ctx.address),
+            device.slot_id,
+            0,
+            TRB_ADDR_DEV,
+        )?;
         let event = self.wait_for_event(TRB_COMPLETION_EVENT, POLL_TIMEOUT_US)?;
         let completion = Self::completion_code(event[2]);
         let slot_id = ((event[3] >> 24) & 0xFF) as u8;
@@ -643,6 +1093,359 @@ impl Xhci {
         Ok(())
     }
 
+    fn set_interface(
+        &mut self,
+        device: &mut XhciDevice,
+        interface: u8,
+        alternate: u8,
+    ) -> Result<(), ()> {
+        let _ = self.control_transfer(
+            device,
+            SetupPacket {
+                request_type: USB_RECIP_INTERFACE,
+                request: USB_REQ_SET_INTERFACE,
+                value: alternate as u16,
+                index: interface as u16,
+                length: 0,
+            },
+            0,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn configure_hub_device(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        device_descriptor: &[u8; 18],
+    ) -> Result<HubDescriptor, ()> {
+        let mut config_header = [0u8; 9];
+        self.get_descriptor(hub_device, USB_DT_CONFIG, 0, &mut config_header)?;
+        let configuration_value = config_header[5];
+        self.set_configuration(hub_device, configuration_value)?;
+        Self::delay_ms(10);
+        println!("xHCI: hub set to configuration {}", configuration_value);
+
+        let mut multi_tt = false;
+        if hub_device.speed == UsbSpeed::High && device_descriptor[6] == USB_HUB_PR_HS_MULTI_TT {
+            match self.set_interface(hub_device, 0, 1) {
+                Ok(()) => {
+                    multi_tt = true;
+                    println!("xHCI: hub enabled Multi-TT mode");
+                }
+                Err(()) => {
+                    println!("xHCI: hub Multi-TT selection failed, using Single-TT mode");
+                }
+            }
+        }
+
+        let mut hub_descriptor = self.read_hub_descriptor(hub_device, multi_tt)?;
+        self.update_hub_device(hub_device, &hub_descriptor)?;
+        self.power_hub_ports(hub_device, &hub_descriptor)?;
+        hub_descriptor.multi_tt = multi_tt;
+        Ok(hub_descriptor)
+    }
+
+    fn read_hub_descriptor(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        multi_tt: bool,
+    ) -> Result<HubDescriptor, ()> {
+        let descriptor_type = if hub_device.speed == UsbSpeed::Super {
+            USB_DT_SS_HUB
+        } else {
+            USB_DT_HUB
+        };
+        let mut header = [0u8; 7];
+        let header_len = self.control_transfer(
+            hub_device,
+            SetupPacket {
+                request_type: USB_DIR_IN | USB_RT_HUB,
+                request: USB_REQ_GET_DESCRIPTOR,
+                value: (descriptor_type as u16) << 8,
+                index: 0,
+                length: header.len() as u16,
+            },
+            header.as_mut_ptr() as usize,
+            header.len(),
+        )?;
+        if header_len < header.len() {
+            println!("xHCI: hub descriptor header was truncated ({header_len} bytes)");
+            return Err(());
+        }
+        let descriptor_len = header[0] as usize;
+        if descriptor_len < header.len() || descriptor_len > 32 {
+            println!("xHCI: unsupported hub descriptor length {descriptor_len}");
+            return Err(());
+        }
+
+        let mut buffer = [0u8; 32];
+        let full_len = self.control_transfer(
+            hub_device,
+            SetupPacket {
+                request_type: USB_DIR_IN | USB_RT_HUB,
+                request: USB_REQ_GET_DESCRIPTOR,
+                value: (descriptor_type as u16) << 8,
+                index: 0,
+                length: descriptor_len as u16,
+            },
+            buffer.as_mut_ptr() as usize,
+            descriptor_len,
+        )?;
+        if full_len < descriptor_len {
+            println!(
+                "xHCI: hub descriptor read was short (got {full_len} expected {descriptor_len})"
+            );
+            return Err(());
+        }
+
+        let characteristics = u16::from_le_bytes([buffer[3], buffer[4]]);
+        let hub = HubDescriptor {
+            num_ports: buffer[2],
+            power_on_to_good_ms: buffer[5] as u16 * 2,
+            tt_think_time: ((characteristics & HUB_CHAR_TTTT) >> HUB_CHAR_TTTT_SHIFT) as u8,
+            multi_tt,
+        };
+        println!(
+            "xHCI: hub descriptor type {:#04X}, {} downstream ports, {} power switching, TT think time {}",
+            descriptor_type,
+            hub.num_ports,
+            if (characteristics & HUB_CHAR_LPSM) == HUB_CHAR_INDV_PORT_LPSM {
+                "per-port"
+            } else {
+                "ganged"
+            },
+            (hub.tt_think_time + 1) * 8
+        );
+        Ok(hub)
+    }
+
+    fn update_hub_device(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        hub_descriptor: &HubDescriptor,
+    ) -> Result<(), ()> {
+        unsafe {
+            write_bytes(
+                hub_device.in_ctx.address as *mut u8,
+                0,
+                hub_device.in_ctx.size,
+            )
+        };
+        let out_slot = self.slot_context_mut(&hub_device.out_ctx, false);
+        let in_slot = self.slot_context_mut(&hub_device.in_ctx, true);
+        unsafe {
+            copy_nonoverlapping(
+                out_slot as *const SlotContext,
+                in_slot as *mut SlotContext,
+                1,
+            );
+        }
+
+        let ctrl_ctx = self.input_control_context_mut(&hub_device.in_ctx);
+        ctrl_ctx.drop_flags = 0;
+        ctrl_ctx.add_flags = SLOT_FLAG;
+        in_slot.dev_info |= DEV_HUB;
+        if hub_descriptor.multi_tt {
+            in_slot.dev_info |= DEV_MTT;
+        } else {
+            in_slot.dev_info &= !DEV_MTT;
+        }
+        in_slot.dev_info2 |= Self::max_ports(hub_descriptor.num_ports as u32);
+        if hub_device.speed == UsbSpeed::High {
+            in_slot.tt_info |= Self::tt_think_time(hub_descriptor.tt_think_time as u32);
+        }
+        in_slot.dev_state = 0;
+        hub_device.in_ctx.clean();
+
+        self.queue_command(
+            to_bus(hub_device.in_ctx.address),
+            hub_device.slot_id,
+            0,
+            TRB_CONFIG_EP,
+        )?;
+        let event = self.wait_for_event(TRB_COMPLETION_EVENT, POLL_TIMEOUT_US)?;
+        let completion = Self::completion_code(event[2]);
+        let slot_id = ((event[3] >> 24) & 0xFF) as u8;
+        self.acknowledge_event();
+        if completion != COMP_SUCCESS || slot_id != hub_device.slot_id {
+            println!("xHCI: hub Configure Endpoint failed with completion {completion}");
+            return Err(());
+        }
+        hub_device.out_ctx.invalidate();
+        println!(
+            "xHCI: hub slot {} updated for {} downstream ports",
+            hub_device.slot_id, hub_descriptor.num_ports
+        );
+        Ok(())
+    }
+
+    fn power_hub_ports(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        hub_descriptor: &HubDescriptor,
+    ) -> Result<(), ()> {
+        println!(
+            "xHCI: powering {} hub downstream ports",
+            hub_descriptor.num_ports
+        );
+        for port in 1..=hub_descriptor.num_ports {
+            if hub_device.speed == UsbSpeed::Super {
+                self.hub_set_port_feature(hub_device, port, USB_PORT_FEAT_RESET)?;
+            }
+            self.hub_set_port_feature(hub_device, port, USB_PORT_FEAT_POWER)?;
+        }
+        Self::delay_ms(hub_descriptor.power_on_to_good_ms.max(100));
+        Ok(())
+    }
+
+    /// Resets a single hub downstream port, returning the negotiated speed
+    /// when a device is present and successfully enabled. Returns `None` for
+    /// an empty or unusable port so the caller can try the next one.
+    fn reset_hub_downstream_port(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+    ) -> Option<UsbSpeed> {
+        let status = self.hub_get_port_status(hub_device, port).ok()?;
+        println!(
+            "xHCI: hub port {} status {:#06X} change {:#06X}",
+            port, status.status, status.change
+        );
+        if (status.status & USB_PORT_STAT_CONNECTION) == 0 {
+            return None;
+        }
+        println!("xHCI: resetting hub downstream port {}", port);
+        let enumerated = self.reset_hub_port(hub_device, port).ok()?;
+        if (enumerated.status & USB_PORT_STAT_CONNECTION) == 0
+            || (enumerated.status & USB_PORT_STAT_ENABLE) == 0
+        {
+            println!(
+                "xHCI: hub port {} failed to enable after reset ({:#06X})",
+                port, enumerated.status
+            );
+            return None;
+        }
+        Self::hub_port_speed(hub_device.speed, enumerated.status).ok()
+    }
+
+    fn reset_hub_port(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+    ) -> Result<HubPortStatus, ()> {
+        let mut delay_us = HUB_SHORT_RESET_DELAY_US;
+        for attempt in 1..=5 {
+            self.hub_set_port_feature(hub_device, port, USB_PORT_FEAT_RESET)?;
+            Self::delay_us(delay_us);
+            let status = self.wait_for_hub_port_reset(hub_device, port)?;
+            println!(
+                "xHCI: hub port {} reset attempt {} -> status {:#06X} change {:#06X}",
+                port, attempt, status.status, status.change
+            );
+            if (status.status & USB_PORT_STAT_ENABLE) != 0 {
+                self.hub_clear_port_feature(hub_device, port, USB_PORT_FEAT_C_RESET)?;
+                return Ok(status);
+            }
+            delay_us = HUB_LONG_RESET_DELAY_US;
+        }
+        Err(())
+    }
+
+    fn wait_for_hub_port_reset(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+    ) -> Result<HubPortStatus, ()> {
+        let deadline = Self::deadline(POLL_TIMEOUT_US);
+        loop {
+            let status = self.hub_get_port_status(hub_device, port)?;
+            if (status.status & USB_PORT_STAT_CONNECTION) == 0 {
+                return Ok(status);
+            }
+            if (status.status & USB_PORT_STAT_RESET) == 0
+                && ((status.change & USB_PORT_STAT_C_RESET) != 0
+                    || (status.status & USB_PORT_STAT_ENABLE) != 0)
+            {
+                return Ok(status);
+            }
+            if Self::deadline_passed(deadline) {
+                return Err(());
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn hub_get_port_status(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+    ) -> Result<HubPortStatus, ()> {
+        let mut buffer = [0u8; 4];
+        let length = self.control_transfer(
+            hub_device,
+            SetupPacket {
+                request_type: USB_DIR_IN | USB_RT_PORT,
+                request: USB_REQ_GET_STATUS,
+                value: 0,
+                index: port as u16,
+                length: buffer.len() as u16,
+            },
+            buffer.as_mut_ptr() as usize,
+            buffer.len(),
+        )?;
+        if length < buffer.len() {
+            println!("xHCI: short hub port status read on port {}", port);
+            return Err(());
+        }
+        Ok(HubPortStatus {
+            status: u16::from_le_bytes([buffer[0], buffer[1]]),
+            change: u16::from_le_bytes([buffer[2], buffer[3]]),
+        })
+    }
+
+    fn hub_set_port_feature(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+        feature: u16,
+    ) -> Result<(), ()> {
+        let _ = self.control_transfer(
+            hub_device,
+            SetupPacket {
+                request_type: USB_RT_PORT,
+                request: USB_REQ_SET_FEATURE,
+                value: feature,
+                index: port as u16,
+                length: 0,
+            },
+            0,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn hub_clear_port_feature(
+        &mut self,
+        hub_device: &mut XhciDevice,
+        port: u8,
+        feature: u16,
+    ) -> Result<(), ()> {
+        let _ = self.control_transfer(
+            hub_device,
+            SetupPacket {
+                request_type: USB_RT_PORT,
+                request: USB_REQ_CLEAR_FEATURE,
+                value: feature,
+                index: port as u16,
+                length: 0,
+            },
+            0,
+            0,
+        )?;
+        Ok(())
+    }
+
     fn configure_mass_storage_endpoints(
         &mut self,
         device: &mut XhciDevice,
@@ -667,8 +1470,16 @@ impl Xhci {
         let in_slot = self.slot_context_mut(&device.in_ctx, true);
         let in_ep0 = self.endpoint_context_mut(&device.in_ctx, 0, true);
         unsafe {
-            copy_nonoverlapping(out_slot as *const SlotContext, in_slot as *mut SlotContext, 1);
-            copy_nonoverlapping(out_ep0 as *const EndpointContext, in_ep0 as *mut EndpointContext, 1);
+            copy_nonoverlapping(
+                out_slot as *const SlotContext,
+                in_slot as *mut SlotContext,
+                1,
+            );
+            copy_nonoverlapping(
+                out_ep0 as *const EndpointContext,
+                in_ep0 as *mut EndpointContext,
+                1,
+            );
         }
 
         let ctrl_ctx = self.input_control_context_mut(&device.in_ctx);
@@ -685,7 +1496,7 @@ impl Xhci {
             | Self::max_packet(max_packet_out)
             | Self::max_burst(max_burst_out as u32)
             | Self::error_count(3);
-        out_ctx.deq = out_ring.region.address as u64 | out_ring.cycle_state as u64;
+        out_ctx.deq = to_bus(out_ring.region.address) | out_ring.cycle_state as u64;
         out_ctx.tx_info = max_packet_out as u32;
 
         let in_ctx = self.endpoint_context_mut(&device.in_ctx, bulk_in_index, true);
@@ -694,11 +1505,16 @@ impl Xhci {
             | Self::max_packet(max_packet_in)
             | Self::max_burst(max_burst_in as u32)
             | Self::error_count(3);
-        in_ctx.deq = in_ring.region.address as u64 | in_ring.cycle_state as u64;
+        in_ctx.deq = to_bus(in_ring.region.address) | in_ring.cycle_state as u64;
         in_ctx.tx_info = max_packet_in as u32;
         device.in_ctx.clean();
 
-        self.queue_command(device.in_ctx.address as u64, device.slot_id, 0, TRB_CONFIG_EP)?;
+        self.queue_command(
+            to_bus(device.in_ctx.address),
+            device.slot_id,
+            0,
+            TRB_CONFIG_EP,
+        )?;
         let event = self.wait_for_event(TRB_COMPLETION_EVENT, POLL_TIMEOUT_US)?;
         let completion = Self::completion_code(event[2]);
         let slot_id = ((event[3] >> 24) & 0xFF) as u8;
@@ -743,18 +1559,29 @@ impl Xhci {
         Self::push_trb_raw(ring, setup_fields);
 
         if length > 0 {
-            if (setup.request_type & USB_DIR_IN) == 0 {
-                unsafe { asm::clean_dcache_range(buffer_address, length) };
-            }
+            /* U-Boot's xhci_ctrl_tx flushes (cleans) the buffer before every
+             * data-stage transfer regardless of direction, not only for OUT.
+             * This is required even for IN transfers: without it, a stale
+             * dirty cache line covering this buffer (e.g. from the caller's
+             * zero-initialization) can be evicted after the controller's DMA
+             * write lands in RAM, silently clobbering the received data with
+             * the old cached contents before we get to invalidate it. */
+            unsafe { asm::clean_dcache_range(buffer_address, length) };
             let mut data_flags = Self::trb_type(TRB_DATA);
             if (setup.request_type & USB_DIR_IN) != 0 {
                 data_flags |= TRB_DIR_IN | TRB_ISP;
             }
             data_flags |= ring.cycle_state;
-            let remainder = Self::transfer_trb_remainder(length, length, length, device.ep0_max_packet as usize);
+            let remainder = Self::transfer_trb_remainder(
+                length,
+                length,
+                length,
+                device.ep0_max_packet as usize,
+            );
+            let data_bus = to_bus(buffer_address);
             let data_fields = [
-                buffer_address as u32,
-                (buffer_address >> 32) as u32,
+                data_bus as u32,
+                (data_bus >> 32) as u32,
                 Self::trb_len(length) | Self::trb_td_size(remainder),
                 data_flags,
             ];
@@ -797,9 +1624,12 @@ impl Xhci {
         if length == 0 {
             return Ok(0);
         }
-        if !is_in {
-            unsafe { asm::clean_dcache_range(buffer_address, length) };
-        }
+        /* Always clean (write back) the buffer before the transfer, even for
+         * IN, matching U-Boot's xhci_bulk_tx. Otherwise a stale dirty cache
+         * line over this buffer can be evicted after the controller's DMA
+         * write lands in RAM, clobbering the received data before we
+         * invalidate and read it. */
+        unsafe { asm::clean_dcache_range(buffer_address, length) };
         let start_index = ring.enqueue_index;
         let start_cycle = ring.cycle_state;
         let mut transferred = 0usize;
@@ -807,7 +1637,14 @@ impl Xhci {
         while remaining > 0 {
             let current_address = buffer_address + transferred;
             let boundary_limit = 0x1_0000usize - (current_address & 0xFFFF);
-            let chunk = min(remaining, if boundary_limit == 0 { 0x1_0000 } else { boundary_limit });
+            let chunk = min(
+                remaining,
+                if boundary_limit == 0 {
+                    0x1_0000
+                } else {
+                    boundary_limit
+                },
+            );
             let more = remaining > chunk;
             let mut flags = Self::trb_type(TRB_NORMAL);
             if transferred == 0 {
@@ -825,15 +1662,12 @@ impl Xhci {
             } else {
                 flags |= TRB_IOC;
             }
-            let remainder = Self::transfer_trb_remainder(
-                transferred,
-                chunk,
-                length,
-                max_packet_size as usize,
-            );
+            let remainder =
+                Self::transfer_trb_remainder(transferred, chunk, length, max_packet_size as usize);
+            let current_bus = to_bus(current_address);
             let fields = [
-                current_address as u32,
-                (current_address >> 32) as u32,
+                current_bus as u32,
+                (current_bus >> 32) as u32,
                 Self::trb_len(chunk) | Self::trb_td_size(remainder),
                 flags,
             ];
@@ -877,12 +1711,22 @@ impl Xhci {
                 self.acknowledge_event();
             }
             if Self::deadline_passed(deadline) {
+                println!(
+                    "xHCI: timed out waiting for a transfer event (slot {slot_id} ep {ep_index}, USBSTS={:#X})",
+                    self.read_operational32(0x04)
+                );
                 return Err(());
             }
         }
     }
 
-    fn queue_command(&mut self, address: u64, slot_id: u8, ep_index: usize, command: u32) -> Result<(), ()> {
+    fn queue_command(
+        &mut self,
+        address: u64,
+        slot_id: u8,
+        ep_index: usize,
+        command: u32,
+    ) -> Result<(), ()> {
         let ring = &mut self.command_ring;
         let fields = [
             address as u32,
@@ -894,6 +1738,7 @@ impl Xhci {
                 | ring.cycle_state,
         ];
         Self::push_trb_raw(ring, fields);
+        unsafe { asm::dsb_sy() };
         self.ring_doorbell(0, 0);
         Ok(())
     }
@@ -909,13 +1754,20 @@ impl Xhci {
                 self.acknowledge_event();
             }
             if Self::deadline_passed(deadline) {
+                println!(
+                    "xHCI: timed out waiting for event type {expected_type} (USBSTS={:#X}, USBCMD={:#X})",
+                    self.read_operational32(0x04),
+                    self.read_operational32(0x00)
+                );
                 return Err(());
             }
         }
     }
 
     fn peek_event(&mut self) -> Result<[u32; 4], ()> {
-        self.event_ring.region.invalidate_range(self.event_ring.dequeue_index * 16, 16);
+        self.event_ring
+            .region
+            .invalidate_range(self.event_ring.dequeue_index * 16, 16);
         let address = self.event_ring.region.address + self.event_ring.dequeue_index * 16;
         let event = [
             unsafe { read_volatile(address as *const u32) },
@@ -936,7 +1788,7 @@ impl Xhci {
             self.event_ring.cycle_state ^= 1;
         }
         let dequeue = self.event_ring.region.address + self.event_ring.dequeue_index * 16;
-        self.write_runtime64(0x38, (dequeue as u64 & !ERST_PTR_MASK) | ERST_EHB);
+        self.write_runtime64(0x38, (to_bus(dequeue) & !ERST_PTR_MASK) | ERST_EHB);
     }
 
     fn push_trb_raw(ring: &mut TrbRing, fields: [u32; 4]) {
@@ -965,7 +1817,11 @@ impl Xhci {
     }
 
     fn ring_doorbell(&self, slot_id: u8, ep_index: usize) {
-        let value = if slot_id == 0 { 0 } else { ((ep_index + 1) & 0xFF) as u32 };
+        let value = if slot_id == 0 {
+            0
+        } else {
+            ((ep_index + 1) & 0xFF) as u32
+        };
         Self::write32(self.doorbell_base + slot_id as usize * 4, value);
     }
 
@@ -988,13 +1844,15 @@ impl Xhci {
         if is_input {
             index += 1;
         }
-        unsafe {
-            &mut *((ctx.address + index * self.context_size()) as *mut EndpointContext)
-        }
+        unsafe { &mut *((ctx.address + index * self.context_size()) as *mut EndpointContext) }
     }
 
     fn context_size(&self) -> usize {
-        if (self.hccparams & HCC_64BYTE_CONTEXT) != 0 { 64 } else { 32 }
+        if (self.hccparams & HCC_64BYTE_CONTEXT) != 0 {
+            64
+        } else {
+            32
+        }
     }
 
     fn device_context_size(&self) -> usize {
@@ -1033,12 +1891,12 @@ impl Xhci {
                     let ep_address = descriptor[offset + 2];
                     let attributes = descriptor[offset + 3] & 0x3;
                     if attributes == USB_ENDPOINT_XFER_BULK {
-                        let max_packet = u16::from_le_bytes([
-                            descriptor[offset + 4],
-                            descriptor[offset + 5],
-                        ]);
+                        let max_packet =
+                            u16::from_le_bytes([descriptor[offset + 4], descriptor[offset + 5]]);
                         let max_burst = if speed == UsbSpeed::Super {
-                            Self::parse_superspeed_endpoint_companion(descriptor, offset, ep_address)
+                            Self::parse_superspeed_endpoint_companion(
+                                descriptor, offset, ep_address,
+                            )
                         } else {
                             0
                         };
@@ -1119,7 +1977,17 @@ impl Xhci {
     }
 
     fn clear_port_change_bits(&self, port_id: u8, status: u32) {
-        self.write_portsc(port_id, Self::port_state_to_neutral(status) | PORT_CSC | PORT_PEC | PORT_WRC | PORT_OCC | PORT_RC | PORT_PLC | PORT_CEC);
+        self.write_portsc(
+            port_id,
+            Self::port_state_to_neutral(status)
+                | PORT_CSC
+                | PORT_PEC
+                | PORT_WRC
+                | PORT_OCC
+                | PORT_RC
+                | PORT_PLC
+                | PORT_CEC,
+        );
     }
 
     fn port_state_to_neutral(status: u32) -> u32 {
@@ -1144,7 +2012,10 @@ impl Xhci {
         expected: u32,
         timeout_us: u64,
     ) -> Result<(), ()> {
-        self.wait_until(|| (self.read_operational32(offset) & mask) == expected, timeout_us)
+        self.wait_until(
+            || (self.read_operational32(offset) & mask) == expected,
+            timeout_us,
+        )
     }
 
     fn read_operational32(&self, offset: usize) -> u32 {
@@ -1171,6 +2042,16 @@ impl Xhci {
         unsafe { read_volatile(address as *const u32) }
     }
 
+    fn read64(address: usize) -> u64 {
+        let low = Self::read32(address) as u64;
+        let high = Self::read32(address + 4) as u64;
+        (high << 32) | low
+    }
+
+    fn read_runtime32(&self, offset: usize) -> u32 {
+        Self::read32(self.runtime_base + offset)
+    }
+
     fn write32(address: usize, value: u32) {
         unsafe { write_volatile(address as *mut u32, value) };
     }
@@ -1193,6 +2074,44 @@ impl Xhci {
             UsbSpeed::High => SLOT_SPEED_HS,
             UsbSpeed::Super => SLOT_SPEED_SS,
         }
+    }
+
+    fn speed_name(speed: UsbSpeed) -> &'static str {
+        match speed {
+            UsbSpeed::Low => "Low-Speed",
+            UsbSpeed::Full => "Full-Speed",
+            UsbSpeed::High => "High-Speed",
+            UsbSpeed::Super => "SuperSpeed",
+        }
+    }
+
+    fn hub_port_speed(hub_speed: UsbSpeed, port_status: u16) -> Result<UsbSpeed, ()> {
+        if hub_speed == UsbSpeed::Super
+            || (port_status & USB_PORT_STAT_SPEED_MASK) == USB_PORT_STAT_SUPER_SPEED
+        {
+            return Ok(UsbSpeed::Super);
+        }
+        Ok(match port_status & USB_PORT_STAT_SPEED_MASK {
+            USB_PORT_STAT_LOW_SPEED => UsbSpeed::Low,
+            USB_PORT_STAT_HIGH_SPEED => UsbSpeed::High,
+            _ => UsbSpeed::Full,
+        })
+    }
+
+    fn max_ports(value: u32) -> u32 {
+        value << MAX_PORTS_SHIFT
+    }
+
+    fn tt_slot(value: u32) -> u32 {
+        value
+    }
+
+    fn tt_port(value: u32) -> u32 {
+        value << TT_PORT_SHIFT
+    }
+
+    fn tt_think_time(value: u32) -> u32 {
+        value << TT_THINK_TIME_SHIFT
     }
 
     fn ep_type(value: u32) -> u32 {
@@ -1233,7 +2152,10 @@ impl Xhci {
         total_len: usize,
         max_packet: usize,
     ) -> usize {
-        if current_trb_len == total_len || max_packet == 0 || transferred_before + current_trb_len >= total_len {
+        if current_trb_len == total_len
+            || max_packet == 0
+            || transferred_before + current_trb_len >= total_len
+        {
             return 0;
         }
         let total_packets = total_len.div_ceil(max_packet);
@@ -1250,12 +2172,27 @@ impl Xhci {
 
     fn deadline(timeout_us: u64) -> u64 {
         let freq = asm::get_cntfrq_el0();
-        let ticks = if freq == 0 { timeout_us } else { (timeout_us * freq).div_ceil(1_000_000) };
+        let ticks = if freq == 0 {
+            timeout_us
+        } else {
+            (timeout_us * freq).div_ceil(1_000_000)
+        };
         asm::get_cntpct_el0().wrapping_add(ticks)
     }
 
     fn deadline_passed(deadline: u64) -> bool {
         asm::get_cntpct_el0().wrapping_sub(deadline) < (1u64 << 63)
+    }
+
+    fn delay_us(duration_us: u64) {
+        let deadline = Self::deadline(duration_us);
+        while !Self::deadline_passed(deadline) {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn delay_ms(duration_ms: u16) {
+        Self::delay_us(duration_ms as u64 * 1_000);
     }
 }
 
@@ -1264,7 +2201,25 @@ impl DmaRegion {
         let pages = size.div_ceil(4096).max(1);
         let address = crate::allocate_pages(pages, align_order).map_err(|_| ())?;
         unsafe { write_bytes(address as *mut u8, 0, pages * 4096) };
-        Ok(Self { address, size, pages })
+        let region = Self {
+            address,
+            size,
+            pages,
+        };
+        /*
+         * Flush the zero-fill to RAM immediately. The xHCI controller reads
+         * this memory via DMA (bypassing the CPU cache), so any caller that
+         * forgets to (or only partially, e.g. a single TRB's worth of) clean
+         * this region before the controller's next doorbell/register write
+         * risks the controller observing stale/garbage cache-line contents
+         * instead of the zeroed buffer -- this was intermittently causing a
+         * Host System Error (USBSTS HSE) right after starting the
+         * controller, since the command ring/event ring segments were zeroed
+         * here but never explicitly flushed in bulk before CRCR/ERSTBA were
+         * programmed.
+         */
+        region.clean();
+        Ok(region)
     }
 
     fn clean(&self) {
@@ -1294,9 +2249,10 @@ impl TrbRing {
         };
         if link_trb {
             let link = (ring.region.address + LINK_TRB_INDEX * 16) as *mut u32;
+            let link_bus = to_bus(ring.region.address);
             unsafe {
-                write_volatile(link.add(0), ring.region.address as u32);
-                write_volatile(link.add(1), (ring.region.address >> 32) as u32);
+                write_volatile(link.add(0), link_bus as u32);
+                write_volatile(link.add(1), (link_bus >> 32) as u32);
                 write_volatile(link.add(2), 0);
                 write_volatile(link.add(3), Xhci::trb_type(TRB_LINK) | LINK_TOGGLE);
             }

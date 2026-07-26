@@ -622,7 +622,7 @@ fn init_usb_storage(dtb: &dtb::Dtb) -> Option<usb_mass_storage::UsbMassStorage> 
         "PCIe xHCI device {:04X}:{:04X} at CPU MMIO {:#X}",
         xhci_pci.vendor_id, xhci_pci.device_id, xhci_pci.cpu_mmio_base
     );
-    let Ok(xhci) = xhci::Xhci::new(xhci_pci.cpu_mmio_base) else {
+    let Ok(xhci) = xhci::Xhci::new(xhci_pci.cpu_mmio_base, xhci_pci.dma_offset) else {
         println!("Failed to initialize the xHCI controller.");
         return None;
     };

@@ -38,6 +38,11 @@ pub struct XhciPciDevice {
     pub vendor_id: u16,
     pub device_id: u16,
     pub cpu_mmio_base: usize,
+    /// Offset that must be added to a CPU physical address to obtain the PCIe
+    /// bus address a downstream DMA master (the VL805 xHCI) must use to reach
+    /// that RAM location. On the BCM2711 this inbound window is not 1:1 (it is
+    /// typically 0x4_00000000); see [`PcieBrcm::dma_offset`].
+    pub dma_offset: u64,
 }
 
 pub struct PcieBrcm {
@@ -90,13 +95,34 @@ impl PcieBrcm {
         }
 
         self.enable_memory_and_bus_master(1, 0, 0).ok()?;
+        let dma_offset = self.dma_offset();
         let cpu_mmio_base = self.translate_bar_to_cpu(self.read_bar_address()?)?;
 
         Some(XhciPciDevice {
             vendor_id,
             device_id,
             cpu_mmio_base,
+            dma_offset,
         })
+    }
+
+    /// Reads the BCM2711 PCIe inbound "BAR2" window configuration and returns
+    /// the offset that must be added to a CPU physical address to form the
+    /// PCIe bus address a downstream DMA master uses to reach that RAM.
+    ///
+    /// On pre-BCM2712 hardware the `RC_BAR2_CONFIG` register holds
+    /// `bus_start - phys_start` in its address bits (the low 5 bits are the
+    /// encoded window size). Firmware/U-Boot programs this to a non-1:1 value
+    /// (observed: 0x4_00000000) so device DMA that targets `cpu_phys` must
+    /// actually be issued to `cpu_phys + offset`; failing to add this offset
+    /// makes the xHCI controller fault every DMA with a Host System Error.
+    pub fn dma_offset(&self) -> u64 {
+        const RC_BAR2_CONFIG_LO: usize = 0x4034;
+        const RC_BAR2_CONFIG_HI: usize = 0x4038;
+        const SIZE_MASK: u32 = 0x1F;
+        let lo = self.read32(self.base_address + RC_BAR2_CONFIG_LO) & !SIZE_MASK;
+        let hi = self.read32(self.base_address + RC_BAR2_CONFIG_HI);
+        ((hi as u64) << 32) | (lo as u64)
     }
 
     fn read_bar_address(&self) -> Option<u64> {
