@@ -151,7 +151,7 @@ impl MemoryAllocator {
                     if let Some(next) = Self::get_next_entry(&self.memory_entry_pool, entry) {
                         self.first_entry = Some(next.id);
                     } else {
-                        return Err(MemoryError::NoEntry);
+                        self.first_entry = None;
                     }
                 }
                 Self::unchain_entry_from_free_list(
@@ -391,7 +391,7 @@ impl MemoryAllocator {
     pub fn allocate(&mut self, size: usize, align_order: usize) -> Result<usize, MemoryError> {
         if size == 0 {
             return Err(MemoryError::InvalidRequest);
-        } else if self.free_size <= size {
+        } else if self.free_size < size {
             return Err(MemoryError::NoMemory);
         }
         let page_order = Self::size_to_page_order(size);
@@ -456,7 +456,6 @@ impl MemoryAllocator {
             self.free_size = size;
         } else {
             self.define_free_memory(start, size)?;
-            self.free_size += size;
         }
         Ok(())
     }
@@ -688,4 +687,312 @@ impl MemoryEntry {
 
 const fn get_end_address(address: usize, size: usize) -> usize {
     address + size - 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOTAL_SIZE: usize = 0x20_0000;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Range {
+        start: usize,
+        size: usize,
+    }
+
+    impl Range {
+        fn end(self) -> usize {
+            self.start + self.size - 1
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn next_usize(&mut self, upper: usize) -> usize {
+            if upper <= 1 {
+                0
+            } else {
+                (self.next_u64() as usize) % upper
+            }
+        }
+    }
+
+    fn overlap(a: Range, b: Range) -> bool {
+        a.start <= b.end() && b.start <= a.end()
+    }
+
+    fn assert_non_overlapping(ranges: &[Range]) {
+        for (i, a) in ranges.iter().enumerate() {
+            for b in &ranges[i + 1..] {
+                assert!(!overlap(*a, *b), "overlap detected: {a:?} vs {b:?}");
+            }
+        }
+    }
+
+    fn enabled_entries(allocator: &MemoryAllocator) -> Vec<Range> {
+        let pool = unsafe { &*allocator.memory_entry_pool.get() };
+        pool.iter()
+            .filter(|entry| entry.enabled)
+            .map(|entry| Range {
+                start: entry.start,
+                size: entry.get_size(),
+            })
+            .collect()
+    }
+
+    fn sorted_entries(allocator: &MemoryAllocator) -> Vec<Range> {
+        let mut entries = Vec::new();
+        let mut current = allocator.first_entry;
+        while let Some(id) = current {
+            let entry = MemoryAllocator::get_memory_entry(&allocator.memory_entry_pool, id)
+                .expect("valid entry id");
+            assert!(entry.enabled, "disabled entry in main chain: {id}");
+            entries.push(Range {
+                start: entry.start,
+                size: entry.get_size(),
+            });
+            current = entry.next;
+        }
+        entries
+    }
+
+    fn assert_allocator_invariants(allocator: &MemoryAllocator, expected_free: &[Range]) {
+        let mut chain_entries = sorted_entries(allocator);
+        let mut pool_entries = enabled_entries(allocator);
+        chain_entries.sort_by_key(|range| range.start);
+        pool_entries.sort_by_key(|range| range.start);
+        assert_eq!(chain_entries, pool_entries, "pool and chain disagree");
+        assert_non_overlapping(&chain_entries);
+
+        for (prev, next) in chain_entries.iter().zip(chain_entries.iter().skip(1)) {
+            assert!(
+                prev.end() + 1 < next.start,
+                "adjacent/overlapping free entries were not coalesced: {prev:?} {next:?}"
+            );
+        }
+
+        let pool = unsafe { &*allocator.memory_entry_pool.get() };
+        let mut seen_free_list_ids = Vec::new();
+        for (order, head) in allocator.free_list.iter().copied().enumerate() {
+            let mut current = head;
+            let mut last_size = 0;
+            while let Some(id) = current {
+                let entry = &pool[id as usize];
+                assert!(entry.enabled, "disabled entry in free list {order}: {id}");
+                let entry_order = MemoryAllocator::size_to_page_order(entry.get_size());
+                assert_eq!(entry_order, order, "entry {id} is in wrong free list order");
+                assert!(
+                    last_size <= entry.get_size(),
+                    "free list {order} is not sorted by size"
+                );
+                last_size = entry.get_size();
+                seen_free_list_ids.push(id);
+                current = entry.list_next;
+            }
+        }
+
+        seen_free_list_ids.sort_unstable();
+        seen_free_list_ids.dedup();
+        assert_eq!(
+            seen_free_list_ids.len(),
+            chain_entries.len(),
+            "free lists do not cover every enabled entry exactly once"
+        );
+
+        let expected_total: usize = expected_free.iter().map(|range| range.size).sum();
+        assert_eq!(
+            allocator.free_size, expected_total,
+            "free_size accounting mismatch"
+        );
+
+        let mut actual_free = chain_entries;
+        actual_free.sort_by_key(|range| range.start);
+        let mut expected = expected_free.to_vec();
+        expected.sort_by_key(|range| range.start);
+        assert_eq!(actual_free, expected, "allocator free ranges diverged");
+    }
+
+    fn insert_free_range(free_ranges: &mut Vec<Range>, range: Range) {
+        free_ranges.push(range);
+        free_ranges.sort_by_key(|free| free.start);
+
+        let mut merged: Vec<Range> = Vec::with_capacity(free_ranges.len());
+        for free in free_ranges.drain(..) {
+            if let Some(last) = merged.last_mut() {
+                if last.end() + 1 >= free.start {
+                    let new_end = last.end().max(free.end());
+                    last.size = new_end - last.start + 1;
+                    continue;
+                }
+            }
+            merged.push(free);
+        }
+        *free_ranges = merged;
+    }
+
+    fn remove_free_subrange(free_ranges: &mut Vec<Range>, target: Range) {
+        let index = free_ranges
+            .iter()
+            .position(|free| target.start >= free.start && target.end() <= free.end())
+            .expect("target must be free");
+        let original = free_ranges.remove(index);
+        if original.start < target.start {
+            free_ranges.push(Range {
+                start: original.start,
+                size: target.start - original.start,
+            });
+        }
+        if target.end() < original.end() {
+            free_ranges.push(Range {
+                start: target.end() + 1,
+                size: original.end() - target.end(),
+            });
+        }
+        free_ranges.sort_by_key(|range| range.start);
+    }
+
+    fn reserve_some_ranges(
+        allocator: &mut MemoryAllocator,
+        free_ranges: &mut Vec<Range>,
+        reserved: &mut Vec<Range>,
+    ) {
+        for range in [
+            Range {
+                start: 0x1000,
+                size: 0x7000,
+            },
+            Range {
+                start: 0x20000,
+                size: 0x18000,
+            },
+            Range {
+                start: 0x180000,
+                size: 0x30000,
+            },
+        ] {
+            allocator
+                .reserve_memory(range.start, range.size, 0)
+                .expect("reserve_memory should succeed");
+            remove_free_subrange(free_ranges, range);
+            reserved.push(range);
+            assert_allocator_invariants(allocator, free_ranges);
+        }
+    }
+
+    #[test]
+    fn free_size_tracks_exact_frees() {
+        let mut allocator = MemoryAllocator::new();
+        allocator.free(0, 1024).unwrap();
+        assert_eq!(allocator.free_size, 1024);
+
+        let first = allocator.allocate(128, 0).unwrap();
+        assert_eq!(first, 0);
+        assert_eq!(allocator.free_size, 896);
+
+        allocator.free(first, 128).unwrap();
+        assert_eq!(
+            allocator.free_size, 1024,
+            "free() should restore exactly the bytes that were allocated"
+        );
+    }
+
+    #[test]
+    fn allocate_can_consume_last_free_entry() {
+        let mut allocator = MemoryAllocator::new();
+        allocator.free(0x2000, 256).unwrap();
+
+        let address = allocator.allocate(256, 0).unwrap();
+        assert_eq!(address, 0x2000);
+        assert_eq!(allocator.first_entry, None);
+        assert_eq!(allocator.free_size, 0);
+    }
+
+    #[test]
+    fn fuzz_allocate_free_and_reserve() {
+        for seed in 0..64u64 {
+            let mut allocator = MemoryAllocator::new();
+            allocator.free(0, TOTAL_SIZE).unwrap();
+
+            let mut rng = Rng::new(0xC0FFEE_u64 ^ seed);
+            let mut free_ranges = vec![Range {
+                start: 0,
+                size: TOTAL_SIZE,
+            }];
+            let mut reserved = Vec::new();
+            let mut allocations = Vec::new();
+
+            reserve_some_ranges(&mut allocator, &mut free_ranges, &mut reserved);
+
+            for _ in 0..2000 {
+                let fragment_pressure = enabled_entries(&allocator).len();
+                let do_alloc = allocations.is_empty()
+                    || (fragment_pressure < MemoryAllocator::POOL_SIZE - 8
+                        && rng.next_usize(100) < 65);
+                if do_alloc {
+                    let size = 0x100 + rng.next_usize(0x7F00);
+                    let align_order = match rng.next_usize(8) {
+                        0 => 0,
+                        1 => 1,
+                        2 => 2,
+                        3 => 3,
+                        4 => 4,
+                        5 => 8,
+                        6 => 12,
+                        _ => 16,
+                    };
+                    let address = match allocator.allocate(size, align_order) {
+                        Ok(address) => address,
+                        Err(MemoryError::NoMemory) => {
+                            assert_allocator_invariants(&allocator, &free_ranges);
+                            continue;
+                        }
+                        Err(MemoryError::NoEntry) => {
+                            assert_eq!(
+                                enabled_entries(&allocator).len(),
+                                MemoryAllocator::POOL_SIZE
+                            );
+                            assert_allocator_invariants(&allocator, &free_ranges);
+                            continue;
+                        }
+                        Err(err) => panic!("unexpected allocation error: {err:?} (seed {seed})"),
+                    };
+                    let range = Range {
+                        start: address,
+                        size,
+                    };
+                    assert_non_overlapping(&allocations);
+                    for live in allocations.iter().chain(reserved.iter()) {
+                        assert!(
+                            !overlap(*live, range),
+                            "allocator returned overlapping range {range:?} with live {live:?} (seed {seed})"
+                        );
+                    }
+                    remove_free_subrange(&mut free_ranges, range);
+                    allocations.push(range);
+                } else {
+                    let index = rng.next_usize(allocations.len());
+                    let range = allocations.swap_remove(index);
+                    allocator.free(range.start, range.size).unwrap();
+                    insert_free_range(&mut free_ranges, range);
+                }
+
+                assert_non_overlapping(&allocations);
+                assert_allocator_invariants(&allocator, &free_ranges);
+            }
+        }
+    }
 }

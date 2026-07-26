@@ -173,6 +173,7 @@ pub struct Genet {
     phy_addr: u8,
     phy_id1: u16,
     phy_id2: u16,
+    tx_prod_index: u16,
     tx_index: u16,
     rx_index: u16,
     c_index: u16,
@@ -202,6 +203,7 @@ impl Genet {
             phy_addr,
             phy_id1,
             phy_id2,
+            tx_prod_index: 0,
             tx_index: 0,
             rx_index: 0,
             c_index: 0,
@@ -284,12 +286,13 @@ impl Genet {
         if (self.tx_index as usize) >= NUMBER_OF_DESCRIPTORS {
             self.tx_index = 0;
         }
-        let target_prod = (self.read_register(TDMA_PROD_INDEX) & 0xFFFF).wrapping_add(1);
-        self.write_register(TDMA_PROD_INDEX, target_prod);
+        let target_prod = self.tx_prod_index.wrapping_add(1);
+        self.tx_prod_index = target_prod;
+        self.write_register(TDMA_PROD_INDEX, target_prod as u32);
 
         for _ in 0..DMA_POLL_TIMEOUT {
-            let cons = self.read_register(TDMA_CONS_INDEX) & 0xFFFF;
-            if cons >= target_prod {
+            let cons = (self.read_register(TDMA_CONS_INDEX) & 0xFFFF) as u16;
+            if cons == target_prod {
                 return Ok(());
             }
             core::hint::spin_loop();
@@ -569,8 +572,9 @@ impl Genet {
             RDMA_RING_REG_BASE + DMA_END_ADDR,
             ((NUMBER_OF_DESCRIPTORS * DMA_DESC_SIZE) / size_of::<u32>() - 1) as u32,
         );
-        self.c_index = (self.read_register(RDMA_PROD_INDEX) & 0xFFFF) as u16;
-        self.write_register(RDMA_CONS_INDEX, self.c_index as u32);
+        let rdma_prod = self.read_register(RDMA_PROD_INDEX);
+        self.c_index = (rdma_prod & 0xFFFF) as u16;
+        self.write_register(RDMA_CONS_INDEX, rdma_prod);
         self.rx_index = self.c_index & 0xFF;
         self.write_register(
             RDMA_RING_REG_BASE + DMA_RING_BUF_SIZE,
@@ -589,9 +593,10 @@ impl Genet {
             TDMA_RING_REG_BASE + DMA_END_ADDR,
             ((NUMBER_OF_DESCRIPTORS * DMA_DESC_SIZE) / size_of::<u32>() - 1) as u32,
         );
-        self.tx_index = (self.read_register(TDMA_CONS_INDEX) & 0xFFFF) as u16;
-        self.write_register(TDMA_PROD_INDEX, self.tx_index as u32);
-        self.tx_index &= 0xFF;
+        let tdma_cons = self.read_register(TDMA_CONS_INDEX);
+        self.tx_prod_index = (tdma_cons & 0xFFFF) as u16;
+        self.write_register(TDMA_PROD_INDEX, tdma_cons);
+        self.tx_index = self.tx_prod_index & 0xFF;
         self.write_register(TDMA_MBUF_DONE_THRESH, 1);
         self.write_register(TDMA_FLOW_PERIOD, 0);
         self.write_register(

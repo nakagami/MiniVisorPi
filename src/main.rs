@@ -791,7 +791,7 @@ unsafe impl GlobalAlloc for GlobalAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         match MEMORY_ALLOCATOR
             .lock()
-            .allocate(layout.size(), layout.align())
+            .allocate(layout.size(), layout.align().trailing_zeros() as usize)
         {
             Ok(address) => address as *mut u8,
             Err(e) => {
