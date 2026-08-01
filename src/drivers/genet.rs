@@ -271,8 +271,7 @@ impl Genet {
 
     pub fn send(&mut self, buffer_address: usize, length: usize) -> Result<(), ()> {
         self.ensure_data_path_ready()?;
-        let descriptor_base =
-            self.base_address + GENET_TX_OFF + (self.tx_index as usize) * DMA_DESC_SIZE;
+        let descriptor_base = GENET_TX_OFF + (self.tx_index as usize) * DMA_DESC_SIZE;
         let length_status = ((length as u32) << DMA_BUFLENGTH_SHIFT)
             | (0x3F << DMA_TX_QTAG_SHIFT)
             | DMA_TX_APPEND_CRC
@@ -320,8 +319,7 @@ impl Genet {
         if producer_index.wrapping_sub(self.c_index as u32) > NUMBER_OF_DESCRIPTORS as u32 {
             return None;
         }
-        let descriptor_base =
-            self.base_address + GENET_RX_OFF + (self.rx_index as usize) * DMA_DESC_SIZE;
+        let descriptor_base = GENET_RX_OFF + (self.rx_index as usize) * DMA_DESC_SIZE;
         let length_status = self.read_register(descriptor_base + DMA_DESC_LENGTH_STATUS);
         if (length_status & DMA_OWN) != 0 {
             return None;
@@ -354,7 +352,6 @@ impl Genet {
         if (self.rx_index as usize) >= NUMBER_OF_DESCRIPTORS {
             self.rx_index = 0;
         }
-        println!("GENET: RX {copy_length} bytes (producer_index={producer_index})");
         Some(copy_length)
     }
 
@@ -555,7 +552,7 @@ impl Genet {
     fn rx_descs_init(&self) {
         let length_status = ((RX_BUFFER_LENGTH as u32) << DMA_BUFLENGTH_SHIFT) | DMA_OWN;
         for i in 0..NUMBER_OF_DESCRIPTORS {
-            let descriptor_base = self.base_address + GENET_RX_OFF + i * DMA_DESC_SIZE;
+            let descriptor_base = GENET_RX_OFF + i * DMA_DESC_SIZE;
             let buffer_address = self.rx_buffers + i * RX_BUFFER_LENGTH;
             self.write_descriptor_address(descriptor_base, buffer_address);
             self.write_register(descriptor_base + DMA_DESC_LENGTH_STATUS, length_status);

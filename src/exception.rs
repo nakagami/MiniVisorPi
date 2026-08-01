@@ -73,7 +73,25 @@ s_error_current_el_stack_pointer_0:
 
 .balign 0x080
 synchronous_current_el_stack_pointer_x:
-    b   synchronous_current_el_stack_pointer_x
+    sub sp,   sp, #(8 * 32)
+    stp x30, xzr, [sp, #( 15 * 16)]
+    stp x28, x29, [sp, #( 14 * 16)]
+    stp x26, x27, [sp, #( 13 * 16)]
+    stp x24, x25, [sp, #( 12 * 16)]
+    stp x22, x23, [sp, #( 11 * 16)]
+    stp x20, x21, [sp, #( 10 * 16)]
+    stp x18, x19, [sp, #(  9 * 16)]
+    stp x16, x17, [sp, #(  8 * 16)]
+    stp x14, x15, [sp, #(  7 * 16)]
+    stp x12, x13, [sp, #(  6 * 16)]
+    stp x10, x11, [sp, #(  5 * 16)]
+    stp  x8,  x9, [sp, #(  4 * 16)]
+    stp  x6,  x7, [sp, #(  3 * 16)]
+    stp  x4,  x5, [sp, #(  2 * 16)]
+    stp  x2,  x3, [sp, #(  1 * 16)]
+    stp  x0,  x1, [sp, #(  0 * 16)]
+    mov  x0, sp
+    b   {el2_synchronous_handler}
 
 .balign 0x080
 irq_current_el_stack_pointer_x:
@@ -237,6 +255,7 @@ exit_exception:
 irq_handler = sym irq_handler,
 synchronous_handler = sym synchronous_handler,
 fiq_handler = sym fiq_handler,
+el2_synchronous_handler = sym el2_synchronous_handler,
 );
 
 pub fn setup_exception() {
@@ -244,6 +263,26 @@ pub fn setup_exception() {
         static exception_table: *const u8;
     }
     unsafe { asm::set_vbar_el2(&exception_table as *const _ as usize as u64) };
+}
+
+/// Handles a synchronous exception taken to EL2 while already running at
+/// EL2 (current EL, SP_ELx), i.e. a fault caused directly by the
+/// hypervisor's own code (e.g. an unmapped/invalid MMIO or memory access),
+/// as opposed to a trapped lower-EL (guest) exception. Previously this
+/// vector was an infinite self-branch, which silently hung with no
+/// diagnostic output at all whenever the hypervisor itself faulted; report
+/// the fault syndrome instead so the failure is visible.
+extern "C" fn el2_synchronous_handler(registers: *mut Registers) -> ! {
+    let esr_el2 = asm::get_esr_el2();
+    let far_el2 = asm::get_far_el2();
+    let elr_el2 = asm::get_elr_el2();
+    let ec = (esr_el2 & ESR_EL2_EC) >> ESR_EL2_EC_BITS_OFFSET;
+    let regs = unsafe { &*registers };
+    panic!(
+        "Unhandled EL2-native synchronous exception: ec={ec:#X} esr_el2={esr_el2:#X} \
+         far_el2={far_el2:#X} elr_el2={elr_el2:#X} x0={:#X} x1={:#X} x2={:#X} x30(caller)={:#X}",
+        regs.x0, regs.x1, regs.x2, regs.x30
+    );
 }
 
 extern "C" fn synchronous_handler(registers: *mut Registers) {
