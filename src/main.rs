@@ -47,6 +47,7 @@ use psci::PsciErrorCodes;
 use serial::SerialDevice;
 
 use core::alloc::{GlobalAlloc, Layout};
+use core::arch::naked_asm;
 use core::ffi::CStr;
 use core::mem::MaybeUninit;
 use core::slice;
@@ -105,9 +106,37 @@ static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
 const STACK_SIZE: usize = 0x10000;
 const CONSOLE_SWITCH_KEY: u8 = 0x13; /* Ctrl + S */
 
+/// The real ELF entry point named by `ENTRY(main)` in scripts/{pi4,qemu}.ld.
+///
+/// This must be a bare trampoline with NO Rust-generated prologue: U-Boot (or
+/// QEMU) jumps here with the stack pointer set to the actual top of the
+/// STACK_SIZE region this hypervisor is entitled to use, but a normal `extern
+/// "C" fn main(...)` would first run its own prologue (`sub sp, sp, #N` to
+/// make room for its own locals) *before* any Rust statement -- including one
+/// that tries to read `sp` to learn where the stack starts -- ever executes.
+/// That previously made `setup_memory()`'s stack reservation undercount the
+/// true stack region by `main()`'s own frame size: whichever of `main()`'s
+/// locals happened to sit above the (already-too-low) sampled `sp` value was
+/// left unreserved and thus available to the general-purpose page allocator,
+/// which then handed that same memory to the xHCI driver as its Device
+/// Context Base Address Array -- and DmaRegion::new() zeroes every page it
+/// allocates, silently clobbering those "unprotected" locals (including, on
+/// real Raspberry Pi 4 hardware booting from a USB3/xHCI mass-storage
+/// device, the on-stack `Dtb`'s `header` pointer, producing the "null
+/// pointer dereference occurred" panic in dtb.rs). Capturing the pristine
+/// entry `sp` here, before any frame is carved out of it, and threading it
+/// through to `setup_memory()` fixes this at the source.
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
-    let stack_pointer = asm::get_stack_pointer() as usize;
+pub extern "C" fn main() -> ! {
+    naked_asm!(
+        "mov x2, sp",
+        "b {entry_main}",
+        entry_main = sym entry_main,
+    )
+}
+
+extern "C" fn entry_main(argc: usize, argv: *const *const u8, entry_stack_pointer: usize) -> usize {
     if argc != 2 {
         return 1;
     }
@@ -139,7 +168,7 @@ extern "C" fn main(argc: usize, argv: *const *const u8) -> usize {
         .to_str()
         .expect("Failed to get argv[1]");
     let elf_address = str_to_usize(arg_1).expect("Failed to convert the address");
-    setup_memory(&dtb, dtb_address, elf_address, stack_pointer);
+    setup_memory(&dtb, dtb_address, elf_address, entry_stack_pointer);
 
     exception::setup_exception();
     /* Mask IRQ/FIQ for the remainder of this hypervisor's own EL2 execution context,

@@ -33,12 +33,6 @@ pub unsafe fn eret(x0: u64, x1: u64, x2: u64, x3: u64) -> ! {
     }
 }
 
-pub fn get_stack_pointer() -> u64 {
-    let sp: u64;
-    unsafe { asm!("mov {}, sp", out(reg) sp) };
-    sp
-}
-
 /// Reads the EL2 physical generic timer's free-running counter
 /// (`CNTPCT_EL0`), ticking at `get_cntfrq_el0()` Hz. Used for short
 /// microsecond-scale busy-wait delays (e.g. drivers/sdhci.rs's
@@ -140,7 +134,7 @@ pub unsafe fn invalidate_cache(address: usize) {
     unsafe { asm!("dc ivac, {}", in(reg) address) };
 }
 
-fn get_dcache_line_size() -> usize {
+pub fn get_dcache_line_size() -> usize {
     let ctr_el0: u64;
     unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr_el0) };
     4usize << ((ctr_el0 >> 16) & 0xF)

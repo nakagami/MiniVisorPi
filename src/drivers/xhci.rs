@@ -258,6 +258,10 @@ struct EventRing {
     cycle_state: u32,
 }
 
+struct BounceBuffer {
+    region: DmaRegion,
+}
+
 struct MassStorageConfiguration {
     bulk_in_ep: u8,
     bulk_out_ep: u8,
@@ -1558,6 +1562,16 @@ impl Xhci {
         ];
         Self::push_trb_raw(ring, setup_fields);
 
+        let mut bounce = if length > 0 && Self::needs_bounce_buffer(buffer_address, length) {
+            Some(BounceBuffer::new(length)?)
+        } else {
+            None
+        };
+        let dma_buffer_address = bounce
+            .as_ref()
+            .map(|b| b.address())
+            .unwrap_or(buffer_address);
+
         if length > 0 {
             /* U-Boot's xhci_ctrl_tx flushes (cleans) the buffer before every
              * data-stage transfer regardless of direction, not only for OUT.
@@ -1566,7 +1580,12 @@ impl Xhci {
              * zero-initialization) can be evicted after the controller's DMA
              * write lands in RAM, silently clobbering the received data with
              * the old cached contents before we get to invalidate it. */
-            unsafe { asm::clean_dcache_range(buffer_address, length) };
+            if (setup.request_type & USB_DIR_IN) == 0 {
+                if let Some(bounce) = bounce.as_mut() {
+                    bounce.copy_from(buffer_address, length);
+                }
+            }
+            unsafe { asm::clean_dcache_range(dma_buffer_address, length) };
             let mut data_flags = Self::trb_type(TRB_DATA);
             if (setup.request_type & USB_DIR_IN) != 0 {
                 data_flags |= TRB_DIR_IN | TRB_ISP;
@@ -1578,7 +1597,7 @@ impl Xhci {
                 length,
                 device.ep0_max_packet as usize,
             );
-            let data_bus = to_bus(buffer_address);
+            let data_bus = to_bus(dma_buffer_address);
             let data_fields = [
                 data_bus as u32,
                 (data_bus >> 32) as u32,
@@ -1606,7 +1625,10 @@ impl Xhci {
             return Err(());
         }
         if length > 0 && (setup.request_type & USB_DIR_IN) != 0 {
-            unsafe { asm::invalidate_dcache_range(buffer_address, length) };
+            unsafe { asm::invalidate_dcache_range(dma_buffer_address, length) };
+            if let Some(bounce) = bounce.as_ref() {
+                bounce.copy_to(buffer_address, length);
+            }
         }
         Ok(length.saturating_sub(residue))
     }
@@ -1624,18 +1646,32 @@ impl Xhci {
         if length == 0 {
             return Ok(0);
         }
+        let mut bounce = if Self::needs_bounce_buffer(buffer_address, length) {
+            Some(BounceBuffer::new(length)?)
+        } else {
+            None
+        };
+        let dma_buffer_address = bounce
+            .as_ref()
+            .map(|b| b.address())
+            .unwrap_or(buffer_address);
         /* Always clean (write back) the buffer before the transfer, even for
          * IN, matching U-Boot's xhci_bulk_tx. Otherwise a stale dirty cache
          * line over this buffer can be evicted after the controller's DMA
          * write lands in RAM, clobbering the received data before we
          * invalidate and read it. */
-        unsafe { asm::clean_dcache_range(buffer_address, length) };
+        if !is_in {
+            if let Some(bounce) = bounce.as_mut() {
+                bounce.copy_from(buffer_address, length);
+            }
+        }
+        unsafe { asm::clean_dcache_range(dma_buffer_address, length) };
         let start_index = ring.enqueue_index;
         let start_cycle = ring.cycle_state;
         let mut transferred = 0usize;
         let mut remaining = length;
         while remaining > 0 {
-            let current_address = buffer_address + transferred;
+            let current_address = dma_buffer_address + transferred;
             let boundary_limit = 0x1_0000usize - (current_address & 0xFFFF);
             let chunk = min(
                 remaining,
@@ -1682,7 +1718,10 @@ impl Xhci {
         let residue = Self::event_residue(event[2]) as usize;
         self.acknowledge_event();
         if is_in {
-            unsafe { asm::invalidate_dcache_range(buffer_address, length) };
+            unsafe { asm::invalidate_dcache_range(dma_buffer_address, length) };
+            if let Some(bounce) = bounce.as_ref() {
+                bounce.copy_to(buffer_address, length);
+            }
         }
         if completion != COMP_SUCCESS && completion != COMP_SHORT_TX {
             println!("xHCI: bulk transfer failed with completion {completion}");
@@ -2194,6 +2233,12 @@ impl Xhci {
     fn delay_ms(duration_ms: u16) {
         Self::delay_us(duration_ms as u64 * 1_000);
     }
+
+    fn needs_bounce_buffer(buffer_address: usize, length: usize) -> bool {
+        let line_size = asm::get_dcache_line_size();
+        let mask = line_size - 1;
+        (buffer_address & mask) != 0 || (length & mask) != 0
+    }
 }
 
 impl DmaRegion {
@@ -2281,5 +2326,43 @@ impl EventRing {
             dequeue_index: 0,
             cycle_state: 1,
         })
+    }
+}
+
+impl BounceBuffer {
+    fn new(size: usize) -> Result<Self, ()> {
+        Ok(Self {
+            region: DmaRegion::new(size, 12)?,
+        })
+    }
+
+    fn address(&self) -> usize {
+        self.region.address
+    }
+
+    fn copy_from(&mut self, source_address: usize, size: usize) {
+        unsafe {
+            copy_nonoverlapping(
+                source_address as *const u8,
+                self.region.address as *mut u8,
+                size,
+            )
+        };
+    }
+
+    fn copy_to(&self, destination_address: usize, size: usize) {
+        unsafe {
+            copy_nonoverlapping(
+                self.region.address as *const u8,
+                destination_address as *mut u8,
+                size,
+            )
+        };
+    }
+}
+
+impl Drop for BounceBuffer {
+    fn drop(&mut self) {
+        crate::free_pages(self.region.address, self.region.pages);
     }
 }
