@@ -1633,6 +1633,121 @@ impl Xhci {
         Ok(length.saturating_sub(residue))
     }
 
+    /// The ring holds `TRBS_PER_SEGMENT` slots, one of which is permanently
+    /// occupied by the Link TRB that makes it circular, so at most this many
+    /// data TRBs can be outstanding at once. A single `submit_bulk_transfer`
+    /// call builds its whole Transfer Descriptor (TD) up front and only
+    /// rings the doorbell once, after every TRB has been written -- the
+    /// controller does not start consuming any of them until then. If a
+    /// transfer needed more TRBs than fit in the ring, writing the later
+    /// ones would silently wrap around and overwrite the earlier ones
+    /// before the controller ever got a chance to read them, corrupting the
+    /// TD (confirmed on real Raspberry Pi 4 hardware: a ~24 MiB single-TD
+    /// USB3 bulk read -- far more than the ~63*64KiB the ring can hold --
+    /// hung with "timed out waiting for a transfer event"). Splitting a
+    /// large transfer into multiple back-to-back "waves" of at most this
+    /// many chained TRBs each, doorbell-and-waited-for individually, avoids
+    /// this without limiting how large a single logical transfer can be.
+    const MAX_TRBS_PER_WAVE: usize = TRBS_PER_SEGMENT - 1;
+
+    /// Computes how many bytes starting at `address` can be covered by at
+    /// most [`Self::MAX_TRBS_PER_WAVE`] TRBs, each of which is additionally
+    /// capped at 64KiB and may never straddle a 64KiB boundary (an xHCI TRB
+    /// data-buffer-pointer restriction).
+    fn max_wave_length(mut address: usize, remaining: usize) -> usize {
+        let mut total = 0usize;
+        for _ in 0..Self::MAX_TRBS_PER_WAVE {
+            if total >= remaining {
+                break;
+            }
+            let boundary_limit = 0x1_0000usize - (address & 0xFFFF);
+            let chunk = min(
+                remaining - total,
+                if boundary_limit == 0 {
+                    0x1_0000
+                } else {
+                    boundary_limit
+                },
+            );
+            total += chunk;
+            address += chunk;
+        }
+        total
+    }
+
+    /// Builds and executes a single TD (chain of TRBs, all queued before one
+    /// doorbell ring) covering exactly `wave_length` bytes starting at
+    /// `dma_address`, which must be `<= Self::max_wave_length(dma_address,
+    /// wave_length)`. Returns the number of bytes actually transferred and
+    /// the event's completion code.
+    fn submit_bulk_wave(
+        &mut self,
+        slot_id: u8,
+        ep_index: usize,
+        ring: &mut TrbRing,
+        dma_address: usize,
+        wave_length: usize,
+        max_packet_size: u16,
+        is_in: bool,
+    ) -> Result<(usize, u32), ()> {
+        let start_index = ring.enqueue_index;
+        let start_cycle = ring.cycle_state;
+        let mut transferred = 0usize;
+        let mut remaining = wave_length;
+        while remaining > 0 {
+            let current_address = dma_address + transferred;
+            let boundary_limit = 0x1_0000usize - (current_address & 0xFFFF);
+            let chunk = min(
+                remaining,
+                if boundary_limit == 0 {
+                    0x1_0000
+                } else {
+                    boundary_limit
+                },
+            );
+            let more = remaining > chunk;
+            let mut flags = Self::trb_type(TRB_NORMAL);
+            if transferred == 0 {
+                if start_cycle == 0 {
+                    flags |= TRB_CYCLE;
+                }
+            } else {
+                flags |= ring.cycle_state;
+            }
+            if is_in {
+                flags |= TRB_ISP;
+            }
+            if more {
+                flags |= TRB_CHAIN;
+            } else {
+                flags |= TRB_IOC;
+            }
+            let remainder = Self::transfer_trb_remainder(
+                transferred,
+                chunk,
+                wave_length,
+                max_packet_size as usize,
+            );
+            let current_bus = to_bus(current_address);
+            let fields = [
+                current_bus as u32,
+                (current_bus >> 32) as u32,
+                Self::trb_len(chunk) | Self::trb_td_size(remainder),
+                flags,
+            ];
+            Self::push_trb_raw(ring, fields);
+            transferred += chunk;
+            remaining -= chunk;
+        }
+        Self::commit_first_trb(ring, start_index, start_cycle);
+        self.ring_doorbell(slot_id, ep_index);
+        let event = self.wait_for_transfer_event(slot_id, ep_index, POLL_TIMEOUT_US)?;
+        let completion = Self::completion_code(event[2]);
+        let residue = Self::event_residue(event[2]) as usize;
+        self.acknowledge_event();
+        Ok((wave_length.saturating_sub(residue), completion))
+    }
+
     fn submit_bulk_transfer(
         &mut self,
         slot_id: u8,
@@ -1666,68 +1781,47 @@ impl Xhci {
             }
         }
         unsafe { asm::clean_dcache_range(dma_buffer_address, length) };
-        let start_index = ring.enqueue_index;
-        let start_cycle = ring.cycle_state;
-        let mut transferred = 0usize;
-        let mut remaining = length;
-        while remaining > 0 {
-            let current_address = dma_buffer_address + transferred;
-            let boundary_limit = 0x1_0000usize - (current_address & 0xFFFF);
-            let chunk = min(
-                remaining,
-                if boundary_limit == 0 {
-                    0x1_0000
-                } else {
-                    boundary_limit
-                },
-            );
-            let more = remaining > chunk;
-            let mut flags = Self::trb_type(TRB_NORMAL);
-            if transferred == 0 {
-                if start_cycle == 0 {
-                    flags |= TRB_CYCLE;
+
+        let mut transferred_total = 0usize;
+        let mut offset = 0usize;
+        while offset < length {
+            let wave_address = dma_buffer_address + offset;
+            let wave_length = Self::max_wave_length(wave_address, length - offset);
+            let (wave_transferred, completion) = self.submit_bulk_wave(
+                slot_id,
+                ep_index,
+                ring,
+                wave_address,
+                wave_length,
+                max_packet_size,
+                is_in,
+            )?;
+            if completion != COMP_SUCCESS && completion != COMP_SHORT_TX {
+                println!("xHCI: bulk transfer failed with completion {completion}");
+                if is_in {
+                    unsafe { asm::invalidate_dcache_range(dma_buffer_address, length) };
+                    if let Some(bounce) = bounce.as_ref() {
+                        bounce.copy_to(buffer_address, length);
+                    }
                 }
-            } else {
-                flags |= ring.cycle_state;
+                return Err(());
             }
-            if is_in {
-                flags |= TRB_ISP;
+            transferred_total += wave_transferred;
+            offset += wave_length;
+            /* A short transfer (fewer bytes than requested) ends the overall
+             * transfer early, same as a single-TD transfer would: there is
+             * no more data to wait for from the device. */
+            if wave_transferred < wave_length {
+                break;
             }
-            if more {
-                flags |= TRB_CHAIN;
-            } else {
-                flags |= TRB_IOC;
-            }
-            let remainder =
-                Self::transfer_trb_remainder(transferred, chunk, length, max_packet_size as usize);
-            let current_bus = to_bus(current_address);
-            let fields = [
-                current_bus as u32,
-                (current_bus >> 32) as u32,
-                Self::trb_len(chunk) | Self::trb_td_size(remainder),
-                flags,
-            ];
-            Self::push_trb_raw(ring, fields);
-            transferred += chunk;
-            remaining -= chunk;
         }
-        Self::commit_first_trb(ring, start_index, start_cycle);
-        self.ring_doorbell(slot_id, ep_index);
-        let event = self.wait_for_transfer_event(slot_id, ep_index, POLL_TIMEOUT_US)?;
-        let completion = Self::completion_code(event[2]);
-        let residue = Self::event_residue(event[2]) as usize;
-        self.acknowledge_event();
         if is_in {
             unsafe { asm::invalidate_dcache_range(dma_buffer_address, length) };
             if let Some(bounce) = bounce.as_ref() {
                 bounce.copy_to(buffer_address, length);
             }
         }
-        if completion != COMP_SUCCESS && completion != COMP_SHORT_TX {
-            println!("xHCI: bulk transfer failed with completion {completion}");
-            return Err(());
-        }
-        Ok(length.saturating_sub(residue))
+        Ok(transferred_total)
     }
 
     fn wait_for_transfer_event(
