@@ -187,7 +187,6 @@ impl VirtioNetMmio {
         self.queues[QUEUE_INDEX_RX]
             .write_used(descriptor_id, (VIRTIO_NET_HDR_SIZE + data.len()) as u32);
         self.interrupt_status |= 1;
-        println!("Virtio-Net RX: delivered {} bytes to guest", data.len());
         get_current_vm()
             .get_gic_distributor_mmio()
             .lock()
@@ -223,12 +222,7 @@ impl VirtioNetMmio {
                 let mut net = PHYSICAL_NET.lock();
                 if let Some(net) = net.as_mut() {
                     match net.send(address, data_descriptor.length as usize) {
-                        Ok(()) => {
-                            println!(
-                                "Virtio-Net TX: sent {} bytes",
-                                data_descriptor.length
-                            );
-                        }
+                        Ok(()) => {}
                         Err(()) => {
                             println!(
                                 "Virtio-Net TX: physical send() failed ({} bytes)",
@@ -345,7 +339,6 @@ impl MmioHandler for VirtioNetMmio {
                 }
             }
             VIRTIO_MMIO_QUEUE_NOTIFY => {
-                println!("Virtio-Net: QUEUE_NOTIFY value={value}");
                 if value as usize == QUEUE_INDEX_TX {
                     self.process_tx();
                 }
