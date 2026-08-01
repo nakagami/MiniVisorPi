@@ -144,6 +144,23 @@ impl MemoryAllocator {
         } else {
             return Err(MemoryError::InvalidRequest);
         };
+        /* `start`/`size` may legitimately span past the end of the single
+         * free entry containing `start`: two independently-computed "used"
+         * regions (e.g. this hypervisor's own conservatively page-rounded
+         * stack reservation and a DTB relocated by the bootloader) can end
+         * up overlapping on some boot paths/media, even though neither
+         * computation is wrong on its own. Whatever lies beyond this free
+         * entry's end is -- by definition of the free-list model used here
+         * -- already excluded from the free pool, so only the portion that
+         * is actually still free needs to be carved out here; blindly using
+         * the full requested `size` in that case would make the branches
+         * below compute a new entry with start > end and hit the
+         * `start <= end` assertion in `MemoryEntry::set_range`. */
+        let size = if entry.get_end_address() < get_end_address(start, size) {
+            entry.get_end_address() - start + 1
+        } else {
+            size
+        };
         if entry.get_start_address() == start {
             if entry.get_end_address() == get_end_address(start, size) {
                 /* Delete the entry */
@@ -919,6 +936,46 @@ mod tests {
         assert_eq!(address, 0x2000);
         assert_eq!(allocator.first_entry, None);
         assert_eq!(allocator.free_size, 0);
+    }
+
+    /// Regression test for a real Raspberry Pi 4 microSD-boot panic: the
+    /// bootloader can place the relocated DTB and this hypervisor's own
+    /// (conservatively page-rounded) entry stack such that the two
+    /// independently-computed "used" regions overlap, even though neither
+    /// computation is wrong on its own (see `setup_memory()` in main.rs).
+    /// Reserving the stack region used to hit the `start <= end` assertion
+    /// in `MemoryEntry::set_range` whenever the requested range extended
+    /// past the end of the free entry that contains its start address.
+    #[test]
+    fn reserve_memory_tolerates_overlap_with_prior_reservation() {
+        let mut allocator = MemoryAllocator::new();
+        allocator.free(0, TOTAL_SIZE).unwrap();
+
+        /* Reserve a "DTB"-like region first. */
+        let dtb_start = 0x1000;
+        let dtb_size = 0x1000;
+        allocator.reserve_memory(dtb_start, dtb_size, 0).unwrap();
+
+        /* Reserve a "stack"-like region that starts before the DTB but
+         * extends past its start, overlapping it -- this must not panic,
+         * and must not double-count the already-reserved overlap. */
+        let stack_start = dtb_start - 0x800;
+        let stack_size = 0x1000;
+        allocator
+            .reserve_memory(stack_start, stack_size, 0)
+            .expect("overlapping reservation should be tolerated, not panic");
+
+        let expected_free = vec![
+            Range {
+                start: 0,
+                size: stack_start,
+            },
+            Range {
+                start: dtb_start + dtb_size,
+                size: TOTAL_SIZE - (dtb_start + dtb_size),
+            },
+        ];
+        assert_allocator_invariants(&allocator, &expected_free);
     }
 
     #[test]
