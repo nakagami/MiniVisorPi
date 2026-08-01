@@ -7,7 +7,10 @@
 # guest, there may be no Ethernet cable plugged in, so `udhcpc` retries
 # DHCPDISCOVER forever and would otherwise block the rest of boot (and the
 # login prompt) indefinitely. Run it in the background instead so boot always
-# proceeds regardless of link state.
+# proceeds regardless of link state. Its console output (e.g. udhcpc's "no
+# lease, forking to background") is also discarded, since it otherwise prints
+# asynchronously and clutters the login prompt whenever it lands after boot
+# has already finished.
 #
 
 case "$1" in
@@ -15,7 +18,7 @@ case "$1" in
 	printf "Starting network: "
 	/bin/hostname -F /etc/hostname
 	if [ -e /etc/network/interfaces ]; then
-		/sbin/ifup -a &
+		/sbin/ifup -a >/dev/null 2>&1 &
 	fi
 	echo "OK (backgrounded)"
 	;;
