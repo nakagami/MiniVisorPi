@@ -12,7 +12,7 @@ AArch64向けの小型Type1ハイパーバイザ
 
 書籍と同様の手順で QEMUの環境で動作しますが、`tools-pi4`以下のスクリプトを使うとRaspberry Pi 4実機向けの起動用SDカードイメージを作成できます。
 
-## Raspberry Pi 4実機向けブートSDカードの作成手順
+## Raspberry Pi 4実機向けブートイメージの作成手順
 
 1. u-boot(実機向け、`rpi_arm64_defconfig`)をビルドします。
    ```
@@ -39,29 +39,11 @@ AArch64向けの小型Type1ハイパーバイザ
    ./tools-pi4/create_sdcard.sh
    ```
    このスクリプトは`u-boot.bin`・`config.txt`・`mini.elf`・`boot.scr`・Linuxカーネル(`Image`)・rootfs(`DISK0`)を含むFAT32イメージを`bin-pi4/disk.img`に生成します(4.で配置した`bcm2711-rpi-4-b.dtb`・`start4.elf`・`fixup4.dat`・`overlays/disable-bt.dtbo`もそのまま含まれます)。
-6. 作成した`bin-pi4/disk.img`を物理SDカードに書き込みます。`/dev/sdX`は環境に合わせて読み替えてください。
+6. 作成した`bin-pi4/disk.img`を物理SDカードもしくは USBメモリに書き込みます。`/dev/sdX`は環境に合わせて読み替えてください。
    ```
    sudo dd if=bin-pi4/disk.img of=/dev/sdX bs=4M status=progress conv=fsync
    ```
-7. SDカードをRaspberry Pi 4に挿して起動します。
-
-## BCM2711 GENET (有線LAN) の現状
-
-Raspberry Pi 4 実機では、QEMU用の物理 Virtio-Net が存在しない場合に BCM2711 GENET を物理ネットワークbackendとして使用します。  
-実装は以下です。
-
-- MDIO 経由のPHY検出・リンク判定
-- GENET RX/TX DMAリングの初期化
-- ゲスト virtio-net (MMIO) と GENET の送受信ブリッジ
-
-GENET受信は、Pi4で物理IRQ配線差異の影響を受けにくくするため、ゲストWFIトラップ時ポーリングでも取り込みます。
-
-起動ログ例:
-```
-GENET: base=0xFD580000 phy_addr=1 phy_id=XXXX:XXXX
-GENET link is up (phy_link=true mac_link=false)
-```
-
+7. SDカードもしくは USB メモリをRaspberry Pi 4に挿して起動します。
 
 ## ライセンスについて
 本ソフトウェアはApache License, Version 2.0にてライセンスされています。
