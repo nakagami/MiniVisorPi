@@ -95,7 +95,22 @@ fn number_of_concatenated_page_tables(t0sz: u8, first_level: i8) -> usize {
     }
 }
 
-pub fn init_stage2_translation_table() {
+/// Allocates and zero-initializes a brand-new Stage 2 translation table for
+/// one VCPU, and (re-)programs VTCR_EL2 to match it. VTCR_EL2 only encodes
+/// hardware-derived translation-granule parameters (from ID_AA64MMFR0_EL1),
+/// which are identical for every VCPU sharing a pCPU, so redundantly setting
+/// it again here for a second/queued VCPU on the same pCPU is harmless.
+///
+/// Unlike the old `init_stage2_translation_table`, this does **not** touch
+/// the live VTTBR_EL2: the caller must map this VCPU's guest memory into the
+/// returned table (via `map_address_stage2`/`map_device_stage2`, passing
+/// this table address) and only later make it the live translation regime
+/// with `activate_stage2_translation_table`, once this VCPU actually starts
+/// running (immediately for the first VCPU on a pCPU, or later from
+/// `vm::try_yield_to_next_vcpu` for a queued one). This is what allows a
+/// queued VCPU's table to be built up without corrupting the Stage 2
+/// mappings of whichever VCPU is currently active on this pCPU.
+pub fn create_stage2_translation_table() -> usize {
     let ps = asm::get_id_aa64mmfr0_el1() & ID_AA64MMFR0_EL1_PARANGE;
     let (t0sz, initial_lookup_level) = match ps {
         0b000 => (32u64, 1i8),
@@ -128,8 +143,21 @@ pub fn init_stage2_translation_table() {
 
     unsafe {
         asm::set_vtcr_el2(vtcr_el2);
-        asm::set_vttbr_el2(table as u64);
     }
+
+    table
+}
+
+/// Makes `table_address` (as returned by `create_stage2_translation_table`)
+/// the live Stage 2 translation regime for this pCPU, tagged with `vmid` so
+/// its TLB entries do not collide with those of other VCPUs previously (or
+/// concurrently, on other pCPUs) scheduled with a different VMID. Must be
+/// called before ever `eret`ing into (or resuming) the VCPU that owns this
+/// table.
+pub fn activate_stage2_translation_table(table_address: usize, vmid: u64) {
+    let vttbr_el2 =
+        ((vmid << VTTBR_VMID_BITS_OFFSET) & VTTBR_VMID) | (table_address as u64 & VTTBR_BADDR);
+    unsafe { asm::set_vttbr_el2(vttbr_el2) };
 }
 
 fn _map_address_stage2(
@@ -231,7 +259,12 @@ fn _map_address_stage2(
     Ok(())
 }
 
+/// Maps `map_size` bytes of normal (write-back) guest memory into the
+/// Stage 2 translation table at `table_address` (as returned by
+/// `create_stage2_translation_table`), which need not be the table
+/// currently live in VTTBR_EL2.
 pub fn map_address_stage2(
+    table_address: usize,
     physical_address: usize,
     intermediate_physical_address: usize,
     map_size: usize,
@@ -239,6 +272,7 @@ pub fn map_address_stage2(
     is_writable: bool,
 ) -> Result<(), ()> {
     map_address_stage2_internal(
+        table_address,
         physical_address,
         intermediate_physical_address,
         map_size,
@@ -249,8 +283,11 @@ pub fn map_address_stage2(
 }
 
 /// Function for directly passthrough-mapping device memory, such as MMIO, to the guest.
-/// (Used when passing the GICv2 Virtual CPU Interface to the guest)
+/// (Used when passing the GICv2 Virtual CPU Interface to the guest). Like
+/// `map_address_stage2`, operates on the explicit `table_address` rather
+/// than whichever table is currently live in VTTBR_EL2.
 pub fn map_device_stage2(
+    table_address: usize,
     physical_address: usize,
     intermediate_physical_address: usize,
     map_size: usize,
@@ -258,6 +295,7 @@ pub fn map_device_stage2(
     is_writable: bool,
 ) -> Result<(), ()> {
     map_address_stage2_internal(
+        table_address,
         physical_address,
         intermediate_physical_address,
         map_size,
@@ -268,6 +306,7 @@ pub fn map_device_stage2(
 }
 
 fn map_address_stage2_internal(
+    table_address: usize,
     mut physical_address: usize,
     mut intermediate_physical_address: usize,
     mut map_size: usize,
@@ -279,7 +318,6 @@ fn map_address_stage2_internal(
         println!("Map size is not aligned.");
         return Err(());
     }
-    let table_address = (asm::get_vttbr_el2() & VTTBR_BADDR) as usize;
     let vtcr_el2 = asm::get_vtcr_el2();
     let sl0 = ((vtcr_el2 & VTCR_EL2_SL0) >> VTCR_EL2_SL0_BITS_OFFSET) as u8;
     let t0sz = ((vtcr_el2 & VTCR_EL2_T0SZ) >> VTCR_EL2_T0SZ_BITS_OFFSET) as u8;
@@ -303,6 +341,14 @@ fn map_address_stage2_internal(
         num_of_descriptors,
     )?;
 
-    asm::flush_tlb_el1();
+    /* Only flushing when `table_address` is the table currently live in
+     * VTTBR_EL2 is correct (and sufficient): a table being built up for a
+     * not-yet-activated VCPU (see `create_stage2_translation_table`) cannot
+     * have any stale TLB entries yet, so there is nothing to invalidate for
+     * it, and flushing here would only discard the *active* VCPU's TLB
+     * entries for no reason. */
+    if table_address == (asm::get_vttbr_el2() & VTTBR_BADDR) as usize {
+        asm::flush_tlb_el1();
+    }
     Ok(())
 }

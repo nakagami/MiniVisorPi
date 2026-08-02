@@ -25,7 +25,7 @@ const GICH_LR_HW_OFFSET: u32 = 31;
 const GICH_LR_HW: u32 = 1 << GICH_LR_HW_OFFSET;
 
 /* Maximum number of List Registers used by this hypervisor */
-const NUMBER_OF_SUPPORTED_LRS: usize = 4;
+pub const NUMBER_OF_SUPPORTED_LRS: usize = 4;
 
 pub fn init_vgic(gich: &GicHypervisorInterface, distributor: &GicDistributor) {
     gich.init();

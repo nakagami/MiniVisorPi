@@ -23,6 +23,14 @@ pub const SPSR_EL2_M_EL1H: u64 = 0b0101;
 
 /* VTTBR_EL2 */
 pub const VTTBR_BADDR: u64 = ((1 << 47) - 1) & !1;
+/// 8-bit VMID field (valid when VTCR_EL2.VS == 0, i.e. an 8-bit VMID, which
+/// is what `paging::create_stage2_translation_table` configures). Tags
+/// Stage 2 (and combined Stage 1+2) TLB entries so that multiple VCPUs
+/// scheduled on the same pCPU, each with their own Stage 2 translation
+/// table, can share the physical TLB without their entries colliding or
+/// needing an explicit flush on every VCPU switch.
+pub const VTTBR_VMID_BITS_OFFSET: u64 = 48;
+pub const VTTBR_VMID: u64 = 0xFF << VTTBR_VMID_BITS_OFFSET;
 
 /* VTCR_EL2 */
 pub const VTCR_EL2_RES1: u64 = 1 << 31;

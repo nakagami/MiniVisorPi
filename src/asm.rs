@@ -22,6 +22,12 @@ pub unsafe fn set_spsr_el2(spsr_el2: u64) {
     unsafe { asm!("msr spsr_el2, {}", in(reg) spsr_el2) };
 }
 
+pub fn get_spsr_el2() -> u64 {
+    let spsr_el2: u64;
+    unsafe { asm!("mrs {}, spsr_el2", out(reg) spsr_el2) };
+    spsr_el2
+}
+
 pub unsafe fn eret(x0: u64, x1: u64, x2: u64, x3: u64) -> ! {
     unsafe {
         asm!("eret",
@@ -324,3 +330,53 @@ pub fn get_tpidr_el2() -> u64 {
 pub unsafe fn set_tpidr_el2(tpidr_el2: u64) {
     unsafe { asm!("msr tpidr_el2, {}", in(reg) tpidr_el2) };
 }
+
+/// Generates a `get_<name>`/`set_<name>` pair for a guest EL0/EL1 system
+/// register. Unlike `HCR_EL2`/`VTCR_EL2`/etc. above, these registers are
+/// banked *per Exception Level* by the hardware, not per-VM: only one
+/// "copy" of each physically exists, shared by every VCPU that ever runs
+/// at EL1 on this pCPU. Cooperatively switching between multiple VCPUs
+/// scheduled on the same pCPU (see `vm::try_yield_to_next_vcpu`) therefore
+/// requires explicitly saving and restoring every one of them (MMU/cache
+/// configuration, exception vectors, banked stack pointers, the virtual
+/// timer comparator, etc.) as part of that VCPU's off-CPU context (see
+/// `vm::VcpuContext`) -- otherwise an incoming VCPU would keep running
+/// with whatever the outgoing VCPU had last programmed into these
+/// registers (e.g. its MMU translation tables), rather than its own.
+macro_rules! el1_register_accessors {
+    ($reg:ident, $get:ident, $set:ident) => {
+        pub fn $get() -> u64 {
+            let value: u64;
+            unsafe { asm!(concat!("mrs {}, ", stringify!($reg)), out(reg) value) };
+            value
+        }
+
+        pub unsafe fn $set(value: u64) {
+            unsafe { asm!(concat!("msr ", stringify!($reg), ", {}"), in(reg) value) };
+        }
+    };
+}
+
+el1_register_accessors!(sctlr_el1, get_sctlr_el1, set_sctlr_el1);
+el1_register_accessors!(ttbr0_el1, get_ttbr0_el1, set_ttbr0_el1);
+el1_register_accessors!(ttbr1_el1, get_ttbr1_el1, set_ttbr1_el1);
+el1_register_accessors!(tcr_el1, get_tcr_el1, set_tcr_el1);
+el1_register_accessors!(mair_el1, get_mair_el1, set_mair_el1);
+el1_register_accessors!(amair_el1, get_amair_el1, set_amair_el1);
+el1_register_accessors!(vbar_el1, get_vbar_el1, set_vbar_el1);
+el1_register_accessors!(cpacr_el1, get_cpacr_el1, set_cpacr_el1);
+el1_register_accessors!(contextidr_el1, get_contextidr_el1, set_contextidr_el1);
+el1_register_accessors!(esr_el1, get_esr_el1, set_esr_el1);
+el1_register_accessors!(far_el1, get_far_el1, set_far_el1);
+el1_register_accessors!(par_el1, get_par_el1, set_par_el1);
+el1_register_accessors!(afsr0_el1, get_afsr0_el1, set_afsr0_el1);
+el1_register_accessors!(afsr1_el1, get_afsr1_el1, set_afsr1_el1);
+el1_register_accessors!(tpidr_el0, get_tpidr_el0, set_tpidr_el0);
+el1_register_accessors!(tpidr_el1, get_tpidr_el1, set_tpidr_el1);
+el1_register_accessors!(sp_el0, get_sp_el0, set_sp_el0);
+el1_register_accessors!(sp_el1, get_sp_el1, set_sp_el1);
+el1_register_accessors!(elr_el1, get_elr_el1, set_elr_el1);
+el1_register_accessors!(spsr_el1, get_spsr_el1, set_spsr_el1);
+el1_register_accessors!(cntkctl_el1, get_cntkctl_el1, set_cntkctl_el1);
+el1_register_accessors!(cntv_ctl_el0, get_cntv_ctl_el0, set_cntv_ctl_el0);
+el1_register_accessors!(cntv_cval_el0, get_cntv_cval_el0, set_cntv_cval_el0);

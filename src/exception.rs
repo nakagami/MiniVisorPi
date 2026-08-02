@@ -46,6 +46,26 @@ pub struct Registers {
     padding: u64,
 }
 
+impl Registers {
+    /// Number of `u64` slots in this struct (x0-x30 plus the trailing padding
+    /// slot that `exception_table`'s `stp x30, xzr, ...` always zeroes).
+    pub const NUMBER_OF_SLOTS: usize = 32;
+
+    /// Snapshots this trap frame as a flat array, for saving into a VCPU's
+    /// off-CPU context (see `vm::VcpuContext`) when it yields the pCPU.
+    pub fn as_array(&self) -> [u64; Self::NUMBER_OF_SLOTS] {
+        unsafe { core::mem::transmute_copy(self) }
+    }
+
+    /// Overwrites this trap frame with a previously saved VCPU context, so
+    /// that the shared `exit_exception` epilogue (which always pops
+    /// GPRs from *this* trap frame) resumes the restored VCPU instead of
+    /// the one that originally took the trap.
+    pub fn load_array(&mut self, array: &[u64; Self::NUMBER_OF_SLOTS]) {
+        unsafe { core::ptr::write(self as *mut Self as *mut [u64; Self::NUMBER_OF_SLOTS], *array) };
+    }
+}
+
 /* Exception table */
 global_asm!(
     "
@@ -290,7 +310,7 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
     let ec = esr_el2 & ESR_EL2_EC;
     match ec {
         ESR_EL2_EC_DATA_ABORT => data_abort_handler(unsafe { &mut *registers }, esr_el2),
-        ESR_EL2_EC_WFX => wfx_handler(),
+        ESR_EL2_EC_WFX => wfx_handler(unsafe { &mut *registers }),
         _ => {
             panic!("Unknown Exception: {}", ec >> ESR_EL2_EC_BITS_OFFSET);
         }
@@ -302,13 +322,18 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
 /// real Raspberry Pi 4 hardware, WFI is used as a reliable polling point:
 /// 1) drain physical UART RX and inject to the guest PL011
 /// 2) when using the GENET backend, poll physical RX and inject to guest virtio-net
-/// Then advance past WFI so the guest re-evaluates its wait condition.
-fn wfx_handler() {
+/// 3) if another VCPU is queued on this same physical CPU, cooperatively switch to it
+///    (see `vm::try_yield_to_next_vcpu`) instead of always resuming the caller.
+/// Otherwise (or if there is nothing else to run), just advance past WFI so the
+/// guest re-evaluates its wait condition.
+fn wfx_handler(registers: &mut Registers) {
     crate::handle_uart_interrupt();
     if crate::needs_net_polling_on_wfx() {
         crate::handle_net_rx();
     }
-    unsafe { asm::advance_elr_el2() };
+    if !vm::try_yield_to_next_vcpu(registers) {
+        unsafe { asm::advance_elr_el2() };
+    }
 }
 
 /// Handles a physical FIQ, i.e. a Group 0 (Secure) interrupt. On real hardware, an SPI

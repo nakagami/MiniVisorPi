@@ -6,8 +6,9 @@ use crate::asm;
 use crate::drivers::block_device::BlockDevice;
 use crate::drivers::{
     generic_timer,
-    gicv2::{GicDistributor, GicHypervisorInterface},
+    gicv2::{self as physical_gicv2, GicDistributor, GicHypervisorInterface},
 };
+use crate::exception::Registers;
 use crate::fat32::Fat32;
 use crate::lock::Mutex;
 use crate::mmio::{
@@ -23,6 +24,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::collections::linked_list::LinkedList;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 pub trait MmioHandler {
     fn read(&mut self, offset: usize, access_width: u64) -> Result<u64, ()>;
@@ -35,8 +37,173 @@ pub struct MmioEntry {
     handler: Arc<Mutex<dyn MmioHandler + Send>>,
 }
 
+/// Snapshot of every guest-visible EL0/EL1 system register that is banked
+/// per Exception Level by the hardware rather than per-VM (see
+/// `asm::el1_register_accessors`): MMU/cache configuration, the exception
+/// vector base, banked stack pointers, and the virtual timer comparator.
+/// Part of `VcpuContext` because a cooperative VCPU switch (see
+/// `try_yield_to_next_vcpu`) must fully replace this state, or the
+/// incoming VCPU would keep running with the outgoing VCPU's MMU
+/// translation tables and immediately fetch garbage.
+#[derive(Clone, Copy)]
+struct El1Context {
+    sctlr_el1: u64,
+    ttbr0_el1: u64,
+    ttbr1_el1: u64,
+    tcr_el1: u64,
+    mair_el1: u64,
+    amair_el1: u64,
+    vbar_el1: u64,
+    cpacr_el1: u64,
+    contextidr_el1: u64,
+    esr_el1: u64,
+    far_el1: u64,
+    par_el1: u64,
+    afsr0_el1: u64,
+    afsr1_el1: u64,
+    tpidr_el0: u64,
+    tpidr_el1: u64,
+    sp_el0: u64,
+    sp_el1: u64,
+    elr_el1: u64,
+    spsr_el1: u64,
+    cntkctl_el1: u64,
+    cntv_ctl_el0: u64,
+    cntv_cval_el0: u64,
+}
+
+impl El1Context {
+    /// Reads every register covered by `El1Context` from hardware, as it
+    /// currently stands for whichever VCPU is physically running.
+    fn capture_current() -> Self {
+        Self {
+            sctlr_el1: asm::get_sctlr_el1(),
+            ttbr0_el1: asm::get_ttbr0_el1(),
+            ttbr1_el1: asm::get_ttbr1_el1(),
+            tcr_el1: asm::get_tcr_el1(),
+            mair_el1: asm::get_mair_el1(),
+            amair_el1: asm::get_amair_el1(),
+            vbar_el1: asm::get_vbar_el1(),
+            cpacr_el1: asm::get_cpacr_el1(),
+            contextidr_el1: asm::get_contextidr_el1(),
+            esr_el1: asm::get_esr_el1(),
+            far_el1: asm::get_far_el1(),
+            par_el1: asm::get_par_el1(),
+            afsr0_el1: asm::get_afsr0_el1(),
+            afsr1_el1: asm::get_afsr1_el1(),
+            tpidr_el0: asm::get_tpidr_el0(),
+            tpidr_el1: asm::get_tpidr_el1(),
+            sp_el0: asm::get_sp_el0(),
+            sp_el1: asm::get_sp_el1(),
+            elr_el1: asm::get_elr_el1(),
+            spsr_el1: asm::get_spsr_el1(),
+            cntkctl_el1: asm::get_cntkctl_el1(),
+            cntv_ctl_el0: asm::get_cntv_ctl_el0(),
+            cntv_cval_el0: asm::get_cntv_cval_el0(),
+        }
+    }
+
+    /// Programs hardware with this snapshot. Must be called before
+    /// resuming (`eret`ing into) the VCPU this snapshot belongs to.
+    fn activate(&self) {
+        unsafe {
+            asm::set_sctlr_el1(self.sctlr_el1);
+            asm::set_ttbr0_el1(self.ttbr0_el1);
+            asm::set_ttbr1_el1(self.ttbr1_el1);
+            asm::set_tcr_el1(self.tcr_el1);
+            asm::set_mair_el1(self.mair_el1);
+            asm::set_amair_el1(self.amair_el1);
+            asm::set_vbar_el1(self.vbar_el1);
+            asm::set_cpacr_el1(self.cpacr_el1);
+            asm::set_contextidr_el1(self.contextidr_el1);
+            asm::set_esr_el1(self.esr_el1);
+            asm::set_far_el1(self.far_el1);
+            asm::set_par_el1(self.par_el1);
+            asm::set_afsr0_el1(self.afsr0_el1);
+            asm::set_afsr1_el1(self.afsr1_el1);
+            asm::set_tpidr_el0(self.tpidr_el0);
+            asm::set_tpidr_el1(self.tpidr_el1);
+            asm::set_sp_el0(self.sp_el0);
+            asm::set_sp_el1(self.sp_el1);
+            asm::set_elr_el1(self.elr_el1);
+            asm::set_spsr_el1(self.spsr_el1);
+            asm::set_cntkctl_el1(self.cntkctl_el1);
+            asm::set_cntv_ctl_el0(self.cntv_ctl_el0);
+            asm::set_cntv_cval_el0(self.cntv_cval_el0);
+        }
+    }
+}
+
+/// The EL1 register state a pCPU has before any guest has ever run on it
+/// (i.e. whatever the firmware/bootloader left behind at EL2 entry).
+/// Captured once, the first time `create_vm` runs on a given pCPU, and
+/// reused as the initial `El1Context` for every VCPU ever created on that
+/// pCPU afterwards (see `VM::set_initial_context`): a freshly queued VCPU
+/// that has never run yet must start from this same pristine state, not
+/// from whatever another, already-running VCPU has since programmed into
+/// these registers.
+static RESET_EL1_CONTEXT: Mutex<Option<El1Context>> = Mutex::new(None);
+
+fn reset_el1_context() -> El1Context {
+    *RESET_EL1_CONTEXT
+        .lock()
+        .get_or_insert_with(El1Context::capture_current)
+}
+
+/// Saved off-CPU state of a VCPU that is not currently the one physically
+/// executing on its owning pCPU. Populated with the VCPU's initial boot
+/// state (kernel entry point / DTB pointer argument) at creation time, and
+/// overwritten with a live snapshot every time this VCPU cooperatively
+/// yields the pCPU (see `try_yield_to_next_vcpu`).
+///
+/// Covers what is needed to correctly resume a guest that was interrupted
+/// at a trap boundary, now that each VCPU has its own Stage 2 translation
+/// table and VMID (see `VM::stage2_table_address`/`VM::vmid` and
+/// `paging::activate_stage2_translation_table`): the GPRs captured in the
+/// trap frame, ELR_EL2/SPSR_EL2 (where/how to resume), the hardware GICH
+/// List Registers (pending/active virtual interrupt state), since those
+/// are physical-GIC-banked-per-pCPU resources shared by every VCPU
+/// scheduled on the same pCPU, and every EL0/EL1 system register banked
+/// per Exception Level rather than per-VM (see `El1Context`).
+pub struct VcpuContext {
+    regs: [u64; Registers::NUMBER_OF_SLOTS],
+    elr_el2: u64,
+    spsr_el2: u64,
+    gich_lr: [u32; vgic::NUMBER_OF_SUPPORTED_LRS],
+    el1: El1Context,
+}
+
+impl VcpuContext {
+    fn new() -> Self {
+        Self {
+            regs: [0; Registers::NUMBER_OF_SLOTS],
+            elr_el2: 0,
+            spsr_el2: 0,
+            gich_lr: [0; vgic::NUMBER_OF_SUPPORTED_LRS],
+            el1: reset_el1_context(),
+        }
+    }
+}
+
 pub struct VM {
     vm_id: usize,
+    /// MPIDR-derived affinity of the physical CPU this VCPU is scheduled
+    /// on. Used to find other runnable VCPUs sharing the same pCPU (see
+    /// `try_yield_to_next_vcpu`); VCPUs on different pCPUs are never
+    /// switched between each other since there is only one pCPU per VM
+    /// physically executing at any given moment.
+    owner_affinity: u64,
+    /// Physical base address of this VCPU's own, private Stage 2
+    /// translation table (see `paging::create_stage2_translation_table`).
+    /// Every VCPU gets its own table (even when queued behind another VCPU
+    /// on the same pCPU) so that switching between them can never expose
+    /// one VCPU's guest-physical RAM through another's stale mappings.
+    stage2_table_address: usize,
+    /// This VCPU's unique VTTBR_EL2 VMID (see `registers::VTTBR_VMID`),
+    /// tagging its Stage 2 (and combined Stage 1+2) TLB entries so
+    /// `paging::activate_stage2_translation_table` never needs to flush the
+    /// TLB on every cooperative VCPU switch.
+    vmid: u64,
     ram_virtual_base_address: usize,
     ram_physical_base_address: usize,
     ram_size: usize,
@@ -44,6 +211,7 @@ pub struct VM {
     gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
     pl011_mmio: Arc<Mutex<Pl011Mmio>>,
     virtio_net_mmio: Arc<Mutex<VirtioNetMmio>>,
+    context: Mutex<VcpuContext>,
 }
 
 #[repr(C)]
@@ -63,11 +231,23 @@ struct KernelHeader {
 static VM_LIST: Mutex<LinkedList<Arc<VM>>> = Mutex::new(LinkedList::new());
 static NEXT_VM_ID: AtomicUsize = AtomicUsize::new(0);
 static ACTIVE_VM: Mutex<Option<Arc<VM>>> = Mutex::new(None);
+/// Allocates unique VTTBR_EL2 VMIDs (see `registers::VTTBR_VMID`). The
+/// field is 8 bits wide, so this wraps modulo 256; with one hypervisor
+/// instance managing at most a handful of VCPUs across up to 4 pCPUs (on
+/// Raspberry Pi 4), collisions are not a practical concern.
+static NEXT_VMID: AtomicUsize = AtomicUsize::new(0);
+
+fn allocate_vmid() -> u64 {
+    (NEXT_VMID.fetch_add(1, Ordering::Relaxed) & 0xFF) as u64
+}
 
 impl VM {
     #[allow(clippy::too_many_arguments)]
-    pub const fn new(
+    pub fn new(
         vm_id: usize,
+        owner_affinity: u64,
+        stage2_table_address: usize,
+        vmid: u64,
         ram_virtual_base_address: usize,
         ram_physical_base_address: usize,
         ram_size: usize,
@@ -78,6 +258,9 @@ impl VM {
     ) -> Self {
         Self {
             vm_id,
+            owner_affinity,
+            stage2_table_address,
+            vmid,
             ram_virtual_base_address,
             ram_physical_base_address,
             ram_size,
@@ -85,7 +268,54 @@ impl VM {
             gic_distributor_mmio,
             pl011_mmio,
             virtio_net_mmio,
+            context: Mutex::new(VcpuContext::new()),
         }
+    }
+
+    /// Populates this (not-yet-run) VCPU's saved context with its initial
+    /// boot state: `boot_argument` (the DTB pointer Linux's entry point
+    /// expects in x0) and `boot_entry_point` (ELR_EL2 to resume at, in
+    /// EL1h per `SPSR_EL2_M_EL1H`). Must be called exactly once, before
+    /// this VCPU is ever activated/restored, since `create_vm` only knows
+    /// the true kernel entry point once the image has been loaded and its
+    /// header parsed.
+    fn set_initial_context(&self, boot_entry_point: usize, boot_argument: usize) {
+        let mut context = self.context.lock();
+        context.regs[0] = boot_argument as u64;
+        context.elr_el2 = boot_entry_point as u64;
+        context.spsr_el2 = SPSR_EL2_M_EL1H;
+    }
+
+    /// Saves this VCPU's live state (GPRs from the current trap frame,
+    /// ELR_EL2/SPSR_EL2 telling it where/how to resume, the physical GICH
+    /// List Registers holding its virtual interrupt state, and every
+    /// EL0/EL1 system register banked per Exception Level -- see
+    /// `El1Context`) so it can be resumed later by `restore_context` on
+    /// the same pCPU.
+    fn save_context(&self, registers: &Registers, elr_el2: u64, spsr_el2: u64) {
+        let mut context = self.context.lock();
+        context.regs = registers.as_array();
+        context.elr_el2 = elr_el2;
+        context.spsr_el2 = spsr_el2;
+        for i in 0..vgic::NUMBER_OF_SUPPORTED_LRS {
+            context.gich_lr[i] = physical_gicv2::get_gich_lr(i);
+        }
+        context.el1 = El1Context::capture_current();
+    }
+
+    /// Restores this VCPU's previously saved state into the current trap
+    /// frame, the physical GICH List Registers, and every EL0/EL1 system
+    /// register banked per Exception Level (see `El1Context`), and returns
+    /// the (ELR_EL2, SPSR_EL2) pair the caller must program before
+    /// `eret`ing so execution resumes exactly where this VCPU left off.
+    fn restore_context(&self, registers: &mut Registers) -> (u64, u64) {
+        let context = self.context.lock();
+        registers.load_array(&context.regs);
+        for i in 0..vgic::NUMBER_OF_SUPPORTED_LRS {
+            physical_gicv2::set_gich_lr(i, context.gich_lr[i]);
+        }
+        context.el1.activate();
+        (context.elr_el2, context.spsr_el2)
     }
 
     pub fn handle_mmio_read(&self, address: usize, access_width: u64) -> Result<u64, ()> {
@@ -203,14 +433,29 @@ pub fn create_vm(
     /* Set up registers */
     setup_hypervisor_registers();
 
-    /* Initialize the Stage 2 translation table */
-    init_stage2_translation_table();
-    map_address_stage2(ram_physical_address, RAM_VIRTUAL_BASE, RAM_SIZE, true, true)
-        .expect("Failed to map memory");
+    /* Every VCPU gets its own private Stage 2 translation table (and a
+     * unique VMID), rather than reusing whatever table happens to be live
+     * in VTTBR_EL2. This is what makes it safe to `create_vm` a VCPU that
+     * is only queued behind another one already running on this pCPU (see
+     * `is_first_on_this_pcpu` below): building up this table's mappings
+     * can never disturb the currently active VCPU's own Stage 2 mappings,
+     * since they live in a different table entirely. */
+    let stage2_table_address = create_stage2_translation_table();
+    let vmid = allocate_vmid();
+    map_address_stage2(
+        stage2_table_address,
+        ram_physical_address,
+        RAM_VIRTUAL_BASE,
+        RAM_SIZE,
+        true,
+        true,
+    )
+    .expect("Failed to map memory");
 
     /* Directly passthrough-map the GICv2 Virtual CPU Interface (GICV) to the guest's GICC address.
      * (The guest accesses the hardware virtual CPU interface directly, so EOI/ACK do not trap) */
     map_device_stage2(
+        stage2_table_address,
         gic_virtual_cpu_interface_physical_address,
         GUEST_GIC_CPU_INTERFACE_ADDRESS,
         gic_virtual_cpu_interface_size,
@@ -282,8 +527,12 @@ pub fn create_vm(
     mmio_handlers.push_back(MmioEntry::new(0xa000200, 0x0200, virtio_net_mmio.clone()));
 
     /* Create the VM structure */
+    let owner_affinity = asm::mpidr_to_affinity(cpu_mpidr);
     let vm = VM::new(
         vm_id,
+        owner_affinity,
+        stage2_table_address,
+        vmid,
         RAM_VIRTUAL_BASE,
         ram_physical_address,
         RAM_SIZE,
@@ -331,16 +580,39 @@ pub fn create_vm(
     }
 
     /* Add to the VM structure list */
-    VM_LIST.lock().push_back(Arc::new(vm));
-    switch_active_vm(vm_id);
+    let boot_entry_point = kernel_virtual_address + text_offset as usize;
+    let boot_argument = RAM_VIRTUAL_BASE;
+    vm.set_initial_context(boot_entry_point, boot_argument);
+    let vm = Arc::new(vm);
+    /* If another VCPU is already scheduled on this same pCPU, this one is
+     * only *queued*: leave the currently running VCPU active and let the
+     * cooperative scheduler (`try_yield_to_next_vcpu`, triggered on the
+     * active VCPU's next guest WFI/WFE trap) pick this one up from its
+     * saved (boot) context. Otherwise, this is the first/only VCPU for
+     * this pCPU, so the caller is expected to `boot_vm()` it immediately. */
+    let is_first_on_this_pcpu = !VM_LIST
+        .lock()
+        .iter()
+        .any(|v| v.owner_affinity == owner_affinity);
+    VM_LIST.lock().push_back(vm.clone());
+    if is_first_on_this_pcpu {
+        switch_active_vm(vm_id);
+        unsafe { asm::set_tpidr_el2(vm_id as u64) };
+        /* This is the only VCPU on this pCPU so far, so its Stage 2 table
+         * becomes the live one immediately; the caller (`boot_vm`) erets
+         * into it right after this returns. */
+        activate_stage2_translation_table(stage2_table_address, vmid);
+        println!("Created VM{vm_id} on the CPU(MPIDR_EL1: {:#X})", cpu_mpidr);
+    } else {
+        println!(
+            "Created VM{vm_id} on the CPU(MPIDR_EL1: {:#X}), queued behind VM{} \
+             (will run once the active VCPU on this pCPU yields)",
+            cpu_mpidr,
+            get_current_vm().vm_id
+        );
+    }
 
-    unsafe { asm::set_tpidr_el2(vm_id as u64) };
-    println!("Created VM{vm_id} on the CPU(MPIDR_EL1: {:#X})", cpu_mpidr);
-
-    (
-        kernel_virtual_address + text_offset as usize,
-        RAM_VIRTUAL_BASE,
-    )
+    (boot_entry_point, boot_argument)
 }
 
 pub fn boot_vm(entry_point: usize, argument: usize) -> ! {
@@ -404,4 +676,81 @@ pub fn switch_active_vm(vm_id: usize) -> bool {
     } else {
         false
     }
+}
+
+/// Finds the VCPU that should run next on the *current* pCPU after
+/// `current_vm_id` yields, by round-robining among every VM whose
+/// `owner_affinity` matches this pCPU (i.e. every VCPU ever created on it,
+/// via the initial `create_vm` call or a later queued one). Returns `None`
+/// if `current_vm_id` is the only VCPU on this pCPU (nothing to switch to).
+fn find_next_same_affinity_vcpu(current_vm_id: usize, affinity: u64) -> Option<Arc<VM>> {
+    let candidates: Vec<Arc<VM>> = VM_LIST
+        .lock()
+        .iter()
+        .filter(|vm| vm.owner_affinity == affinity)
+        .cloned()
+        .collect();
+    if candidates.len() <= 1 {
+        return None;
+    }
+    let position = candidates.iter().position(|vm| vm.vm_id == current_vm_id)?;
+    Some(candidates[(position + 1) % candidates.len()].clone())
+}
+
+/// Cooperatively switches the current pCPU from the currently running VCPU
+/// to the next runnable VCPU sharing the same pCPU, if any (round-robin).
+/// Called from the guest WFI/WFE trap handler (`exception::wfx_handler`),
+/// since that is the only point this hypervisor currently has a reliable,
+/// architecturally-defined opportunity to regain control from a running
+/// guest without an asynchronous preemption timer (added in a later phase).
+///
+/// `registers` is the current trap frame: on a successful switch it is
+/// overwritten in place with the target VCPU's saved GPRs, and this
+/// function also reprograms ELR_EL2/SPSR_EL2 directly, so that when
+/// `synchronous_handler`'s caller falls through to the shared
+/// `exit_exception` epilogue, it `eret`s into the *target* VCPU instead of
+/// resuming the one that actually took the trap.
+///
+/// Returns `true` if a switch was performed (the caller must NOT also
+/// advance the outgoing VCPU's ELR_EL2, since this function already does
+/// so before saving its context), or `false` if there was nothing else to
+/// switch to (the caller should fall back to simply advancing past the
+/// WFI/WFE as before).
+///
+/// Note: each VCPU now has its own private Stage 2 translation table and
+/// VMID (see `VM::stage2_table_address`/`VM::vmid`, populated in
+/// `create_vm` and activated here via
+/// `paging::activate_stage2_translation_table`), so multiple VCPUs queued
+/// on the same pCPU no longer alias each other's guest-physical RAM at
+/// 0x40000000+. Preemptive scheduling (an asynchronous timer instead of
+/// only switching at a cooperative WFI/WFE trap) remains for a later
+/// phase.
+pub fn try_yield_to_next_vcpu(registers: &mut Registers) -> bool {
+    let affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
+    let current = get_current_vm();
+    let Some(next) = find_next_same_affinity_vcpu(current.vm_id, affinity) else {
+        return false;
+    };
+
+    /* Advance past the WFI/WFE *before* snapshotting ELR_EL2, so that when
+     * this (outgoing) VCPU is eventually restored, it resumes just after
+     * the instruction that yielded rather than re-trapping on it forever. */
+    unsafe { asm::advance_elr_el2() };
+    let elr_el2 = asm::get_elr_el2();
+    let spsr_el2 = asm::get_spsr_el2();
+    current.save_context(registers, elr_el2, spsr_el2);
+
+    let (next_elr_el2, next_spsr_el2) = next.restore_context(registers);
+    /* Make the target VCPU's own Stage 2 mappings live before resuming it;
+     * its unique VMID means this never requires a TLB flush (see
+     * `paging::activate_stage2_translation_table`), unlike a naive
+     * shared-table approach would. */
+    activate_stage2_translation_table(next.stage2_table_address, next.vmid);
+    unsafe {
+        asm::set_elr_el2(next_elr_el2);
+        asm::set_spsr_el2(next_spsr_el2);
+        asm::set_tpidr_el2(next.vm_id as u64);
+    }
+    *ACTIVE_VM.lock() = Some(next.clone());
+    true
 }

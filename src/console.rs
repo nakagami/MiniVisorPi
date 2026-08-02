@@ -14,9 +14,10 @@ pub struct Console {
 impl Console {
     const BUFFER_SIZE: usize = 64;
     #[allow(clippy::type_complexity)]
-    const COMMAND_LIST: [(&str, fn(SplitWhitespace) -> bool); 4] = [
+    const COMMAND_LIST: [(&str, fn(SplitWhitespace) -> bool); 5] = [
         ("boot", Self::boot_vm),
         ("switch", Self::switch_vm),
+        ("spawn", Self::spawn_vm),
         ("echo", Self::echo),
         ("poweroff", Self::power_off),
     ];
@@ -101,6 +102,17 @@ impl Console {
             println!("Failed to boot a VM");
             true
         }
+    }
+
+    /// Queues a new VCPU on the *current* pCPU (the one whose UART
+    /// interrupt/console-switch-key handling is driving this command),
+    /// instead of `boot`'s new-physical-core path. It becomes active only
+    /// once the currently running VCPU on this pCPU yields via WFI/WFE
+    /// (see `vm::try_yield_to_next_vcpu`).
+    pub fn spawn_vm(_: SplitWhitespace) -> bool {
+        crate::spawn_vcpu_on_current_pcpu();
+        println!("Queued a new VCPU on this pCPU");
+        true
     }
 
     pub fn switch_vm(mut args: SplitWhitespace) -> bool {

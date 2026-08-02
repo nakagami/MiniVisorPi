@@ -885,6 +885,32 @@ pub fn launch_cpu() -> bool {
     false
 }
 
+/// Creates an additional VCPU/VM on the pCPU currently executing this
+/// function, as opposed to [`launch_cpu`] which starts a brand-new
+/// physical core. Unlike [`launch_cpu`] + [`vm::boot_vm`], this never
+/// `eret`s: the new VCPU is only *queued* behind whichever VCPU is
+/// currently active on this pCPU (see `vm::create_vm`'s
+/// `is_first_on_this_pcpu` check) and starts running for the first time
+/// only once that VCPU cooperatively yields via a guest WFI/WFE trap (see
+/// `vm::try_yield_to_next_vcpu`).
+pub fn spawn_vcpu_on_current_pcpu() {
+    let dtb = unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() };
+    let distributor = init_gic_distributor(dtb);
+    let gic_hypervisor_interface = init_gic_hypervisor_interface(dtb);
+    let (gicv_base_address, gicv_size) = get_gic_virtual_cpu_interface(dtb);
+    let fat32 = unsafe { (&raw const FAT32).as_ref().unwrap().assume_init_ref() };
+
+    let _ = vm::create_vm(
+        fat32,
+        &mut *VIRTIO_BLK.lock(),
+        &distributor,
+        &gic_hypervisor_interface,
+        gicv_base_address,
+        gicv_size,
+        get_guest_net_mac(),
+    );
+}
+
 /// Checks whether a `cpu` DTB node advertises the ARM "spin-table" boot
 /// protocol (`enable-method = "spin-table"`) instead of PSCI.
 fn is_spin_table_enable_method(dtb: &dtb::Dtb, cpu: &dtb::DtbNode) -> bool {
