@@ -61,7 +61,15 @@ pub fn create_list_register_entry(
     entry
 }
 
-pub fn add_virtual_interrupt(entry: u32) {
+/// Injects `entry` into a free List Register of the current pCPU.
+///
+/// Returns `false` when every List Register is already occupied by an unrelated interrupt.
+/// The caller must treat that as "not delivered": in particular, if the entry carried the
+/// HW bit (so that the guest's deactivation of the virtual INTID would also deactivate the
+/// physical one), the caller has to deactivate the physical interrupt itself, otherwise it
+/// stays active forever and that pCPU never takes it again.
+#[must_use]
+pub fn add_virtual_interrupt(entry: u32) -> bool {
     let number_of_lrn = gicv2::get_gich_vtr_list_regs();
     let supported_lrn = number_of_lrn.min(NUMBER_OF_SUPPORTED_LRS);
 
@@ -69,13 +77,14 @@ pub fn add_virtual_interrupt(entry: u32) {
         let gich_lrn = gicv2::get_gich_lr(i);
         if (gich_lrn & GICH_LR_STATE) == GICH_LR_STATE_INACTIVE {
             gicv2::set_gich_lr(i, entry);
-            return;
+            return true;
         } else if (gich_lrn & GICH_LR_VIRTUAL_ID) == (entry & GICH_LR_VIRTUAL_ID) {
             gicv2::set_gich_lr(i, gich_lrn | GICH_LR_STATE_PENDING);
-            return;
+            return true;
         }
     }
     println!("GICH_LR is overflowed.");
+    false
 }
 
 pub fn maintenance_interrupt_handler() {

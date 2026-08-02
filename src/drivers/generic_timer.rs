@@ -37,7 +37,13 @@ pub fn init_generic_timer_local(distributor: &gicv2::GicDistributor) {
     distributor.set_enable(int_id, true);
 }
 
-pub fn generic_timer_interrupt_handler() {
+/// Returns `true` if the virtual timer interrupt was successfully injected into the current
+/// vCPU's List Registers. The entry carries the HW bit and the *physical* INTID, so the
+/// guest's deactivation of the virtual interrupt is what deactivates the physical PPI; when
+/// this returns `false` (nothing was injected) the caller must deactivate the physical PPI
+/// itself, or this pCPU's timer is dead for good.
+#[must_use]
+pub fn generic_timer_interrupt_handler() -> bool {
     static TICK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let ticks = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
     if ticks % 1000 == 0 {
@@ -57,5 +63,5 @@ pub fn generic_timer_interrupt_handler() {
             GENERIC_TIMER_VIRTUAL_INT_ID,
             Some(unsafe { GENERIC_TIMER_PHYSICAL_INT_ID }),
             gicv2::get_current_cpu_target(),
-        );
+        )
 }

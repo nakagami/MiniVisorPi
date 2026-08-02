@@ -771,17 +771,34 @@ fn enable_net_interrupt(int_id: u32, distributor: &gicv2::GicDistributor) {
 
 /// Called from the physical Virtio-Net IRQ handler: drains every received
 /// Ethernet frame and forwards it to the currently active VM.
+///
+/// Must never hold `PHYSICAL_NET`'s lock while calling into
+/// `vm::input_net_packet` (which locks the guest's own `virtio_net_mmio`):
+/// `VirtioNetMmio::process_tx` (a guest-triggered MMIO trap) locks
+/// `virtio_net_mmio` first and then `PHYSICAL_NET` to send the packet out.
+/// Now that multiple vCPUs run truly concurrently on separate pCPUs, this
+/// function's physical-RX IRQ handler and a guest's TX MMIO trap can run
+/// on different pCPUs at the same time; acquiring the same two locks in
+/// opposite order would be a classic AB-BA deadlock (observed as some
+/// vCPUs' physical interrupts -- including their own local timer, since
+/// the deadlocked pCPU is stuck spinning inside this exception handler
+/// with IRQs masked -- silently and permanently stopping). Polling the
+/// physical device and forwarding the received packet are therefore kept
+/// as separate steps, each taking only one of the two locks at a time.
 fn handle_net_rx() {
     const MAX_PACKETS_PER_CALL: usize = 16;
     let mut buffer = [0u8; drivers::virtio_net::VIRTIO_NET_RX_BUFFER_SIZE];
-    let mut net = PHYSICAL_NET.lock();
-    let Some(net) = net.as_mut() else {
-        return;
-    };
     let mut processed = 0usize;
     while processed < MAX_PACKETS_PER_CALL {
-        let Some(length) = net.poll_rx(&mut buffer) else {
-            break;
+        let length = {
+            let mut net = PHYSICAL_NET.lock();
+            let Some(net) = net.as_mut() else {
+                return;
+            };
+            let Some(length) = net.poll_rx(&mut buffer) else {
+                break;
+            };
+            length
         };
         vm::input_net_packet(&buffer[..length]);
         processed += 1;

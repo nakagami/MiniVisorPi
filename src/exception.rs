@@ -423,8 +423,18 @@ extern "C" fn irq_handler() {
     } else if interrupt_number == gicv2::INJECT_INTERRUPT_INT_ID {
         gicv2::inject_interrupt_handler();
     } else if interrupt_number == unsafe { generic_timer::GENERIC_TIMER_PHYSICAL_INT_ID } {
-        generic_timer::generic_timer_interrupt_handler();
-        deactivate = false; /* Deactivate is handled by the VGIC */
+        /* When the virtual timer interrupt was injected, its List Register carries the HW
+         * bit plus this physical INTID, so the guest's own deactivation of the virtual
+         * interrupt deactivates the physical one and the hypervisor must not do it here.
+         *
+         * When injection did *not* happen (the guest currently has this banked PPI disabled
+         * -- e.g. it is inside `gic_cpu_init` on this very CPU -- or every List Register was
+         * full), nothing will ever deactivate the physical PPI. Leaving it active would mask
+         * it in the physical GIC forever, permanently killing this pCPU's timer tick (seen
+         * from the guest as an RCU stall with no further scheduler ticks on that CPU), so
+         * deactivate it here instead. The timer condition is level-triggered and still met,
+         * so the line simply re-asserts and the tick is retried a moment later. */
+        deactivate = !generic_timer::generic_timer_interrupt_handler();
     } else if interrupt_number == unsafe { crate::VIRTIO_NET_INT_ID } {
         crate::handle_net_rx();
     } else if interrupt_number != GicCpuInterface::SPURIOUS_INT_ID {
