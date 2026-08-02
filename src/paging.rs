@@ -110,7 +110,15 @@ fn number_of_concatenated_page_tables(t0sz: u8, first_level: i8) -> usize {
 /// `vm::try_yield_to_next_vcpu` for a queued one). This is what allows a
 /// queued VCPU's table to be built up without corrupting the Stage 2
 /// mappings of whichever VCPU is currently active on this pCPU.
-pub fn create_stage2_translation_table() -> usize {
+/// Programs `VTCR_EL2` (Stage 2 translation granule/size parameters) for
+/// the *current* physical CPU. This register is banked per pCPU by
+/// hardware, so it must be (re-)set on every pCPU that will run a VCPU --
+/// not just once when a Stage 2 table is first created (which only runs on
+/// whichever pCPU happened to create that particular table). The computed
+/// value only depends on hardware-derived translation-granule parameters
+/// (from `ID_AA64MMFR0_EL1`), which are identical for every pCPU on this
+/// system, so it is safe (and idempotent) to call this redundantly.
+pub fn set_vtcr_el2_for_this_pcpu() {
     let ps = asm::get_id_aa64mmfr0_el1() & ID_AA64MMFR0_EL1_PARANGE;
     let (t0sz, initial_lookup_level) = match ps {
         0b000 => (32u64, 1i8),
@@ -121,12 +129,6 @@ pub fn create_stage2_translation_table() -> usize {
         0b101 => (16u64, 0i8),
         _ => (16u64, 0i8),
     };
-    let number_of_tables = number_of_concatenated_page_tables(t0sz as u8, initial_lookup_level);
-    let table = allocate_pages(number_of_tables, 12 + number_of_tables - 1).unwrap();
-    for d in unsafe { from_raw_parts_mut(table as *mut Descriptor, number_of_tables * 512) } {
-        d.init();
-    }
-
     let sl0 = if initial_lookup_level == 1 {
         0b01u64
     } else {
@@ -144,6 +146,26 @@ pub fn create_stage2_translation_table() -> usize {
     unsafe {
         asm::set_vtcr_el2(vtcr_el2);
     }
+}
+
+pub fn create_stage2_translation_table() -> usize {
+    let ps = asm::get_id_aa64mmfr0_el1() & ID_AA64MMFR0_EL1_PARANGE;
+    let (t0sz, initial_lookup_level) = match ps {
+        0b000 => (32u64, 1i8),
+        0b001 => (28u64, 1i8),
+        0b010 => (24u64, 1i8),
+        0b011 => (22u64, 1i8),
+        0b100 => (20u64, 0i8),
+        0b101 => (16u64, 0i8),
+        _ => (16u64, 0i8),
+    };
+    let number_of_tables = number_of_concatenated_page_tables(t0sz as u8, initial_lookup_level);
+    let table = allocate_pages(number_of_tables, 12 + number_of_tables - 1).unwrap();
+    for d in unsafe { from_raw_parts_mut(table as *mut Descriptor, number_of_tables * 512) } {
+        d.init();
+    }
+
+    set_vtcr_el2_for_this_pcpu();
 
     table
 }

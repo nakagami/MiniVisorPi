@@ -27,7 +27,7 @@ pub struct GicDistributorMmio {
     target: [u32; 255],
     /// GICv2 target bit of the physical CPU running this VM
     own_target: u8,
-    to_inject_interrupt: LinkedList<u32>,
+    to_inject_interrupt: LinkedList<(u8, u32)>,
 }
 
 const GIC_REVISION: u64 = 2;
@@ -140,6 +140,17 @@ impl GicDistributorMmio {
     }
 
     pub fn trigger_interrupt(&mut self, int_id: u32, physical_int_id: Option<u32>) {
+        self.trigger_interrupt_to(int_id, physical_int_id, self.own_target);
+    }
+
+    /// Same as [`trigger_interrupt`](Self::trigger_interrupt), but delivers to an explicit
+    /// set of target pCPUs (a GICv2 8-bit CPU target bitmask) instead of always `own_target`.
+    /// Used for SGIs (`GICD_SGIR`), whose destination is chosen per-write by the sending
+    /// vCPU rather than being a fixed, interrupt-ID-owned target -- essential once a single
+    /// VM can have multiple concurrently-running vCPUs (true guest SMP), since an SGI/IPI
+    /// sent by one vCPU must reach whichever *other* vCPU(s) it targets, not just whichever
+    /// pCPU originally created the VM.
+    pub fn trigger_interrupt_to(&mut self, int_id: u32, physical_int_id: Option<u32>, targets: u8) {
         self.change_pending_status(int_id, true);
         /* In the single security state with security_extn=false (secure=off), only bit0
          * (Enable) of GICD_CTLR is meaningful, and Linux's GICv2 driver also only writes
@@ -155,13 +166,24 @@ impl GicDistributorMmio {
 
         let list_entry = vgic::create_list_register_entry(int_id, group, priority, physical_int_id);
 
-        if self.own_target == gicv2::get_current_cpu_target() {
-            /* Same pCPU */
-            vgic::add_virtual_interrupt(list_entry);
-        } else {
-            /* pCPU of a different VM */
-            self.to_inject_interrupt.push_back(list_entry);
-            gicv2::send_sgi(self.own_target, INJECT_INTERRUPT_INT_ID);
+        let current_target = gicv2::get_current_cpu_target();
+        for bit in 0..u8::BITS {
+            let target = 1u8 << bit;
+            if (targets & target) == 0 {
+                continue;
+            }
+            if target == current_target {
+                /* Same pCPU: inject directly into this pCPU's own List Registers. */
+                vgic::add_virtual_interrupt(list_entry);
+            } else {
+                /* A different pCPU (either a different VM, sharing this pCPU with the
+                 * cooperative scheduler, or a different vCPU of *this* same VM, running
+                 * concurrently on another physical core): queue the entry tagged with
+                 * its intended destination and prod that pCPU with a physical SGI so it
+                 * services just its own share of the queue. */
+                self.to_inject_interrupt.push_back((target, list_entry));
+                gicv2::send_sgi(target, INJECT_INTERRUPT_INT_ID);
+            }
         }
     }
 }
@@ -169,9 +191,21 @@ impl GicDistributorMmio {
 pub fn inject_interrupt_handler() {
     let vm = vm::get_current_vm();
     let mut distributor = vm.get_gic_distributor_mmio().lock();
-    while let Some(entry) = distributor.to_inject_interrupt.pop_front() {
-        vgic::add_virtual_interrupt(entry);
+    let current_target = gicv2::get_current_cpu_target();
+    /* The queue is shared by every pCPU running a vCPU of this VM (whether that's several
+     * independent VMs cooperatively sharing one pCPU, or several vCPUs of *this* VM running
+     * concurrently on separate pCPUs for true SMP), so only take out and inject the entries
+     * actually destined for this pCPU, leaving any others for their own target pCPU to pick
+     * up when its own physical INJECT_INTERRUPT_INT_ID SGI arrives. */
+    let mut remaining = LinkedList::new();
+    while let Some((target, entry)) = distributor.to_inject_interrupt.pop_front() {
+        if target == current_target {
+            vgic::add_virtual_interrupt(entry);
+        } else {
+            remaining.push_back((target, entry));
+        }
     }
+    distributor.to_inject_interrupt = remaining;
 }
 
 impl MmioHandler for GicDistributorMmio {
@@ -220,14 +254,19 @@ impl MmioHandler for GicDistributorMmio {
             if access_width == 8 {
                 let int_id = int_id_base + byte_offset;
                 if int_id < 32 {
-                    /* SGI/PPI: return own target bit via banked register */
-                    result = self.own_target as u64;
+                    /* SGI/PPI: banked per accessing pCPU -- must reflect *this* pCPU's own
+                     * real GICv2 target bit, not `own_target` (which is fixed to whichever
+                     * pCPU first created this VM). Getting this wrong corrupts the guest's
+                     * own `gic_cpu_map`-equivalent table once more than one pCPU is running
+                     * a vCPU of the same VM (true SMP), since every vCPU would otherwise
+                     * believe its own target bit is the VM-creating pCPU's. */
+                    result = gicv2::get_current_cpu_target() as u64;
                 } else {
                     result = (self.target[register_offset] >> (byte_offset * 8)) as u64 & 0xff;
                 }
             } else if byte_offset == 0 && access_width == 32 {
                 if int_id_base < 32 {
-                    let target = self.own_target as u32;
+                    let target = gicv2::get_current_cpu_target() as u32;
                     result = (target | (target << 8) | (target << 16) | (target << 24)) as u64;
                 } else {
                     result = self.target[register_offset] as u64;
@@ -318,9 +357,19 @@ impl MmioHandler for GicDistributorMmio {
             let register_offset = (offset - GICD_ICFGR0) / size_of::<u32>();
             self.configuration[register_offset] = value as u32;
         } else if offset == GICD_SGIR && access_width == 32 {
-            /* Since this is a 1 VM = 1 vCPU configuration, the target is always self */
             let int_id = (value as u32) & 0xF;
-            self.trigger_interrupt(int_id, None);
+            /* GICD_SGIR[25:24] = TargetListFilter, GICD_SGIR[23:16] = CPUTargetList (a raw
+             * 8-bit GICv2 CPU target bitmask -- since each vCPU of this VM runs 1:1 on a real
+             * physical core, this bitmask can be used directly as the physical pCPU target
+             * bitmask, with no virtual-to-physical translation needed). */
+            const ALL_PCPU_TARGETS: u8 = 0x0F; /* This platform supports up to 4 pCPUs. */
+            let target_list_filter = (value >> 24) & 0b11;
+            let targets = match target_list_filter {
+                0b00 => ((value >> 16) & 0xFF) as u8,
+                0b01 => ALL_PCPU_TARGETS & !gicv2::get_current_cpu_target(),
+                _ => gicv2::get_current_cpu_target(),
+            };
+            self.trigger_interrupt_to(int_id, None, targets);
         }
         Ok(())
     }

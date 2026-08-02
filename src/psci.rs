@@ -8,13 +8,26 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 const PSCI_VERSION: u64 = 0x8400_0000;
 const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
-const PSCI_CPU_ON: u64 = 0xC400_0003;
+/// PSCI CPU_ON function ID (SMC64 variant, per `arm,psci-0.2`/`arm,psci-1.0`).
+/// Also the function ID an AArch64 guest kernel issues to *this* hypervisor
+/// (trapped via HCR_EL2.TSC, see `main::handle_guest_smc`) to bring up an
+/// additional vCPU for true guest SMP.
+pub(crate) const PSCI_CPU_ON: u64 = 0xC400_0003;
 
 /// Stack pointer to hand to a CPU woken up via the ARM "spin-table" boot
 /// protocol (see [`crate::asm::spin_table_entry`]). Must be written just
 /// before [`spin_table_cpu_on`] arms the release address, and is consumed
 /// exactly once by the waking core.
 pub static SPIN_TABLE_SP: AtomicU64 = AtomicU64::new(0);
+
+/// Final Rust-level entry point (e.g. [`crate::core_main`] or
+/// [`crate::smp_park_main`]) that [`crate::asm::spin_table_entry`] jumps to
+/// once it has loaded [`SPIN_TABLE_SP`]. Needed because, unlike PSCI
+/// CPU_ON's `entry_point` argument, the ARM spin-table protocol always
+/// jumps to a single fixed release-address value with no way to pass an
+/// entry point directly, so [`spin_table_cpu_on`] must instead smuggle it
+/// through this static for [`crate::asm::spin_table_entry`] to pick up.
+pub static SPIN_TABLE_TARGET: AtomicU64 = AtomicU64::new(0);
 
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -84,9 +97,14 @@ pub fn system_off() -> ! {
 /// `release_address` is the physical address read from the target CPU's
 /// `cpu-release-addr` DTB property: the platform firmware parks the core
 /// in a `wfe` loop polling that address, and jumps to whatever entry point
-/// is written there once woken with `sev`.
-pub fn spin_table_cpu_on(release_address: usize, stack_pointer: u64) {
+/// is written there once woken with `sev`. The address written there is
+/// always [`crate::asm::spin_table_entry`]; `target` (e.g.
+/// [`crate::core_main`] or [`crate::smp_park_main`]) selects what it jumps
+/// to next, via [`SPIN_TABLE_TARGET`], since the release-address value
+/// itself has no room to encode that choice.
+pub fn spin_table_cpu_on(release_address: usize, stack_pointer: u64, target: u64) {
     SPIN_TABLE_SP.store(stack_pointer, Ordering::SeqCst);
+    SPIN_TABLE_TARGET.store(target, Ordering::SeqCst);
     let entry_point = crate::asm::spin_table_entry as *const () as u64;
     unsafe {
         core::ptr::write_volatile(release_address as *mut u64, entry_point);

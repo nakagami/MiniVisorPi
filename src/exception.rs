@@ -311,8 +311,16 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
     match ec {
         ESR_EL2_EC_DATA_ABORT => data_abort_handler(unsafe { &mut *registers }, esr_el2),
         ESR_EL2_EC_WFX => wfx_handler(unsafe { &mut *registers }),
+        ESR_EL2_EC_SMC64 => crate::handle_guest_smc(unsafe { &mut *registers }),
         _ => {
-            panic!("Unknown Exception: {}", ec >> ESR_EL2_EC_BITS_OFFSET);
+            let far_el2 = asm::get_far_el2();
+            let elr_el2 = asm::get_elr_el2();
+            let mpidr = asm::get_mpidr_el1();
+            panic!(
+                "Unknown Exception: {} esr_el2={esr_el2:#X} far_el2={far_el2:#X} \
+                 elr_el2={elr_el2:#X} mpidr_el1={mpidr:#X}",
+                ec >> ESR_EL2_EC_BITS_OFFSET
+            );
         }
     }
 }

@@ -318,6 +318,13 @@ impl VM {
         (context.elr_el2, context.spsr_el2)
     }
 
+    /// This VM's unique identifier (see `create_vm`/`NEXT_VM_ID`), stored
+    /// per-pCPU in TPIDR_EL2 by `vm::get_current_vm`'s callers so it can be
+    /// looked up again from `VM_LIST`.
+    pub fn vm_id(&self) -> usize {
+        self.vm_id
+    }
+
     pub fn handle_mmio_read(&self, address: usize, access_width: u64) -> Result<u64, ()> {
         for e in &self.mmio_handlers {
             if e.base_address <= address && address < (e.base_address + e.length) {
@@ -638,8 +645,28 @@ fn setup_hypervisor_registers() {
         | HCR_EL2_IMO
         | HCR_EL2_FMO
         | HCR_EL2_TWI
+        | HCR_EL2_TSC
         | HCR_EL2_VM;
     unsafe { asm::set_hcr_el2(hcr_el2) };
+}
+
+/// Makes an already-created VM (see [`create_vm`]) the active guest on the
+/// *current* physical CPU, without creating any new VM, Stage 2 table, or
+/// VMID. Used when a guest's own (virtualized) PSCI CPU_ON brings up an
+/// additional vCPU of a VM that already has other vCPUs concurrently
+/// running on other pCPUs -- true SMP -- as opposed to [`create_vm`]'s "one
+/// brand-new, independent VM per pCPU" model used by the `boot`/`spawn`
+/// debug console commands.
+///
+/// The EL2 system registers this configures (HCR_EL2, VMPIDR_EL2, etc.) are
+/// banked per physical CPU by hardware, so, unlike [`create_vm`], this must
+/// run once on *every* pCPU that will execute a vCPU of `vm`, not just once
+/// per VM.
+pub fn activate_vm_on_this_pcpu(vm: &Arc<VM>) {
+    setup_hypervisor_registers();
+    set_vtcr_el2_for_this_pcpu();
+    activate_stage2_translation_table(vm.stage2_table_address, vm.vmid);
+    unsafe { asm::set_tpidr_el2(vm.vm_id as u64) };
 }
 
 pub fn input_uart(c: u8) {

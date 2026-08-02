@@ -43,11 +43,19 @@ pub fn generic_timer_interrupt_handler() {
     if ticks % 1000 == 0 {
         println!("generic_timer: heartbeat tick={ticks}");
     }
+    /* The Generic Timer's interrupt is a PPI: banked, per-physical-CPU hardware, so this
+     * handler always runs on the very pCPU whose own local timer just fired. The resulting
+     * virtual timer tick must go to *that* pCPU's own vCPU, not always `own_target` (which
+     * is fixed to whichever pCPU first created the VM) -- otherwise, once more than one
+     * pCPU is running a vCPU of the same VM (true SMP), every secondary vCPU's own timer
+     * ticks would be misdelivered to the first vCPU instead, leaving the others without a
+     * scheduler tick (observed as an RCU stall / idling forever). */
     vm::get_current_vm()
         .get_gic_distributor_mmio()
         .lock()
-        .trigger_interrupt(
+        .trigger_interrupt_to(
             GENERIC_TIMER_VIRTUAL_INT_ID,
             Some(unsafe { GENERIC_TIMER_PHYSICAL_INT_ID }),
+            gicv2::get_current_cpu_target(),
         );
 }

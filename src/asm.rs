@@ -265,6 +265,19 @@ pub extern "C" fn core_entry() -> ! {
     )
 }
 
+/// Entry point for a physical CPU brought up (via PSCI CPU_ON) by
+/// [`main::park_secondary_cpus_for_smp`], to be parked at EL2 as an
+/// additional vCPU available to the *same* guest VM, rather than
+/// [`core_entry`]'s "start a brand-new, independent VM" behavior.
+#[unsafe(naked)]
+pub extern "C" fn smp_park_entry() -> ! {
+    naked_asm!("
+            mov sp, x0
+            b   {}",
+        sym crate::smp_park_main
+    )
+}
+
 /// Data Synchronization Barrier (waits for prior memory accesses to complete).
 pub unsafe fn dsb_sy() {
     unsafe { asm!("dsb sy") };
@@ -276,12 +289,25 @@ pub unsafe fn sev() {
     unsafe { asm!("sev") };
 }
 
+/// Waits for an event (typically a subsequent [`sev`] from another core),
+/// or returns immediately if one is already pending. Used to park a
+/// physical CPU cheaply (instead of a hot `spin_loop`) while it waits to be
+/// handed a guest vCPU to run (see `main::smp_park_main`).
+pub fn wfe() {
+    unsafe { asm!("wfe") };
+}
+
 /// Entry point for CPUs woken up through the ARM "spin-table" boot protocol
 /// (used, e.g., by Raspberry Pi 4's firmware instead of PSCI). Unlike
 /// [`core_entry`], no register is guaranteed to hold a usable value when the
 /// firmware's holding pen jumps here, so the stack pointer is instead loaded
 /// from [`crate::psci::SPIN_TABLE_SP`], which must be written by the CPU
 /// bringing this core up *before* arming the spin-table release address.
+/// Which Rust function it ultimately jumps to (e.g. [`crate::core_main`]
+/// or [`crate::smp_park_main`]) is likewise not known statically -- the
+/// spin-table release address can only ever hold this one fixed trampoline
+/// -- so it is loaded from [`crate::psci::SPIN_TABLE_TARGET`] and reached
+/// via an indirect branch instead.
 #[unsafe(naked)]
 pub extern "C" fn spin_table_entry() -> ! {
     naked_asm!("
@@ -289,9 +315,12 @@ pub extern "C" fn spin_table_entry() -> ! {
             add  x0, x0, :lo12:{sp}
             ldr  x0, [x0]
             mov  sp, x0
-            b    {main}",
+            adrp x1, {target}
+            add  x1, x1, :lo12:{target}
+            ldr  x1, [x1]
+            br   x1",
         sp = sym crate::psci::SPIN_TABLE_SP,
-        main = sym crate::core_main,
+        target = sym crate::psci::SPIN_TABLE_TARGET,
     )
 }
 

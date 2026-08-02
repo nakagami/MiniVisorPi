@@ -53,6 +53,9 @@ use core::mem::MaybeUninit;
 use core::slice;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use alloc::collections::linked_list::LinkedList;
+use alloc::sync::Arc;
+
 struct GlobalAllocator {}
 
 enum PhysicalNet {
@@ -101,6 +104,30 @@ static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {};
 static CONSOLE: Mutex<console::Console> = Mutex::new(console::Console::new());
 static IS_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
+
+/// A physical CPU parked (WFE-looping) at EL2 by
+/// [`park_secondary_cpus_for_smp`], available to be handed a vCPU of an
+/// existing VM by a guest-issued (virtualized) PSCI CPU_ON call (see
+/// [`handle_guest_cpu_on`]). This is what lets a single guest kernel image
+/// use multiple CPUs (true SMP), instead of every physical CPU always
+/// hosting its own brand-new, independent VM (the `boot`/`spawn` debug
+/// console commands' model).
+struct ParkedCpu {
+    affinity: u64,
+    launch: Mutex<Option<SmpLaunchRequest>>,
+}
+
+/// What a guest-issued PSCI CPU_ON asked a parked physical CPU to run:
+/// which VM to join (see `vm::activate_vm_on_this_pcpu`), and the
+/// entry point/context id the guest itself supplied.
+struct SmpLaunchRequest {
+    vm: Arc<vm::VM>,
+    entry_point: usize,
+    context_id: usize,
+}
+
+static PARKED_CPUS: Mutex<LinkedList<Arc<ParkedCpu>>> = Mutex::new(LinkedList::new());
+
 
 /// Constants
 const STACK_SIZE: usize = 0x10000;
@@ -259,17 +286,24 @@ extern "C" fn entry_main(argc: usize, argv: *const *const u8, entry_stack_pointe
      * the current-EL synchronous vector, which is just an infinite loop
      * (see `exception.rs`), silently hanging the hypervisor with no
      * output at all. Only probe PSCI when the DTB actually advertises it. */
-    if dtb
+    let has_psci = dtb
         .search_node_by_compatible(b"arm,psci-0.2", None)
         .or_else(|| dtb.search_node_by_compatible(b"arm,psci", None))
-        .is_some()
-    {
+        .is_some();
+    if has_psci {
         let (major_version, minor_version) =
             psci::check_psci_version().expect("PSCI is not supported");
         println!("PSCI version {major_version}.{minor_version}");
     } else {
         println!("PSCI is not present in the devicetree; using spin-table CPU bring-up only.");
     }
+
+    /* Park every other physical CPU described in the DTB so the guest
+     * kernel booted below can bring them up itself (via its own PSCI
+     * CPU_ON calls, virtualized in `handle_guest_smc`) as additional vCPUs
+     * of *this* VM -- true multi-CPU SMP inside a single guest, rather than
+     * each physical CPU always hosting its own independent VM. */
+    park_secondary_cpus_for_smp(&dtb, has_psci);
 
     *VIRTIO_BLK.lock() = virtblk;
     unsafe {
@@ -835,6 +869,190 @@ unsafe impl GlobalAlloc for GlobalAllocator {
     }
 }
 
+/// Brings up every other physical CPU described in the DTB (i.e. every
+/// `cpu` node whose affinity is not this, the boot CPU's) and parks it (see
+/// [`smp_park_main`]), rather than leaving it idle until a debug console
+/// command manually starts a brand-new, independent VM on it (`launch_cpu`).
+/// Each parked CPU can later be claimed by the guest kernel's own
+/// (virtualized) PSCI CPU_ON call -- see [`handle_guest_cpu_on`] -- letting
+/// a single guest use multiple CPUs.
+///
+/// `has_psci` mirrors the same DTB-presence check `entry_main` already
+/// performs before ever executing `smc`: on platforms with no EL3/PSCI
+/// firmware at all (only `enable-method = "spin-table"` cores), issuing
+/// `smc` is undefined behaviour, so non-spin-table nodes are simply skipped
+/// (and reported) instead when `has_psci` is false.
+fn park_secondary_cpus_for_smp(dtb: &dtb::Dtb, has_psci: bool) {
+    let current_affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
+    let mut cpu_node = None;
+    while let Some(cpu) = dtb.search_node(b"cpu", cpu_node.as_ref()) {
+        if let Some((affinity, _)) = dtb.read_reg_property(&cpu, 0)
+            && current_affinity != affinity as u64
+        {
+            let affinity = affinity as u64;
+            let stack_address = allocate_pages(STACK_SIZE >> paging::PAGE_SHIFT, 0)
+                .expect("Failed to allocate memory")
+                + STACK_SIZE;
+            if is_spin_table_enable_method(dtb, &cpu) {
+                let Some(release_address) = read_cpu_release_address(dtb, &cpu) else {
+                    println!(
+                        "CPU(Affinity: {:#X}) is missing a valid cpu-release-addr; \
+                         not available for guest SMP",
+                        affinity
+                    );
+                    free_pages(stack_address - STACK_SIZE, STACK_SIZE >> paging::PAGE_SHIFT);
+                    cpu_node = Some(cpu);
+                    continue;
+                };
+                println!(
+                    "Parking CPU(Affinity: {:#X}) for guest SMP via spin-table \
+                     (release address: {:#X})",
+                    affinity, release_address
+                );
+                psci::spin_table_cpu_on(
+                    release_address,
+                    stack_address as u64,
+                    asm::smp_park_entry as *const () as u64,
+                );
+            } else if has_psci {
+                match psci::cpu_on(
+                    affinity,
+                    asm::smp_park_entry as *const () as usize as u64,
+                    stack_address as u64,
+                ) {
+                    Ok(_) => {
+                        println!("Parking CPU(Affinity: {:#X}) for guest SMP via PSCI", affinity);
+                    }
+                    Err(e) => {
+                        println!(
+                            "Failed to park CPU(Affinity: {:#X}) for guest SMP: {:?}",
+                            affinity, e
+                        );
+                        free_pages(stack_address - STACK_SIZE, STACK_SIZE >> paging::PAGE_SHIFT);
+                    }
+                }
+            } else {
+                println!(
+                    "CPU(Affinity: {:#X}) requires PSCI, which this platform does not \
+                     advertise; not available for guest SMP",
+                    affinity
+                );
+                free_pages(stack_address - STACK_SIZE, STACK_SIZE >> paging::PAGE_SHIFT);
+            }
+        }
+        cpu_node = Some(cpu);
+    }
+}
+
+/// Entry point reached (via [`asm::smp_park_entry`]) by a physical CPU
+/// brought up by [`park_secondary_cpus_for_smp`]. Registers itself as
+/// available, then parks (`wfe`) until a guest-issued PSCI CPU_ON (see
+/// [`handle_guest_cpu_on`]) hands it a vCPU to run, at which point it joins
+/// that VM (see `vm::activate_vm_on_this_pcpu`) and `eret`s into the
+/// guest-supplied entry point -- exactly like a real ARM SMP secondary
+/// core coming online.
+extern "C" fn smp_park_main() -> ! {
+    let current_el = asm::get_currentel() >> 2;
+    assert_eq!(current_el, 2);
+
+    let affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
+    let parked = Arc::new(ParkedCpu {
+        affinity,
+        launch: Mutex::new(None),
+    });
+    PARKED_CPUS.lock().push_back(parked.clone());
+
+    let request = loop {
+        if let Some(request) = parked.launch.lock().take() {
+            break request;
+        }
+        asm::wfe();
+    };
+
+    /* Per-physical-CPU hardware state (EL2 system registers, the physical
+     * GIC CPU/Hypervisor Interfaces, the vGIC's per-core PPI setup) is
+     * banked per pCPU, so it must be (re-)configured here even though this
+     * VM's Stage 2 table/RAM/MMIO devices/GICD are already fully set up by
+     * whichever pCPU originally created it. Re-running the (idempotent)
+     * GICD/GICC/GICH init sequence used by every other pCPU is harmless:
+     * it only ever (re-)writes the same enable bits, never disables
+     * anything another pCPU already depends on. */
+    exception::setup_exception();
+    let dtb = unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() };
+    let distributor = init_gic_distributor(dtb);
+    let _gic_cpu_interface = init_gic_cpu_interface(dtb);
+    let gic_hypervisor_interface = init_gic_hypervisor_interface(dtb);
+    vgic::init_vgic(&gic_hypervisor_interface, &distributor);
+    /* The Generic Timer's enable bit, like its interrupt, is banked per pCPU, so it must be
+     * (re-)armed here too -- otherwise this pCPU's own local timer PPI never actually fires,
+     * leaving this vCPU without a scheduler tick once it goes idle. */
+    generic_timer::init_generic_timer_local(&distributor);
+
+    vm::activate_vm_on_this_pcpu(&request.vm);
+    println!(
+        "CPU(Affinity: {:#X}) joined VM{} as an additional vCPU (entry point: {:#X})",
+        affinity,
+        request.vm.vm_id(),
+        request.entry_point
+    );
+    vm::boot_vm(request.entry_point, request.context_id)
+}
+
+/// Virtualizes the guest's own PSCI SMC calls (trapped via HCR_EL2.TSC,
+/// since this DTB's `psci` node advertises `method = "smc"`). Only CPU_ON
+/// is actually virtualized, to let the guest kernel bring up additional
+/// vCPUs of *this same* VM on the physical CPUs parked by
+/// [`park_secondary_cpus_for_smp`] -- true multi-vCPU SMP, as opposed to
+/// the `boot`/`spawn` debug console commands' separate-VM-per-pCPU model.
+/// Every other PSCI function (SYSTEM_OFF, SYSTEM_RESET, CPU_OFF, version
+/// queries, ...) is passed through to the real firmware unmodified, e.g.
+/// so a guest-issued shutdown/reboot still powers off/resets real
+/// hardware.
+pub fn handle_guest_smc(registers: &mut exception::Registers) {
+    registers.x0 = if registers.x0 == psci::PSCI_CPU_ON {
+        handle_guest_cpu_on(registers.x1, registers.x2 as usize, registers.x3 as usize)
+    } else {
+        unsafe { asm::smc(registers.x0, registers.x1, registers.x2, registers.x3) }
+    };
+    unsafe { asm::advance_elr_el2() };
+}
+
+/// Services a guest-issued PSCI CPU_ON (see [`handle_guest_smc`]): finds
+/// the physical CPU matching `target_cpu`'s affinity among those parked by
+/// [`park_secondary_cpus_for_smp`], removes it from the parked pool, hands
+/// it the requested entry point/context id (joining the *caller's* VM --
+/// i.e. whichever vCPU issued this CPU_ON, via `vm::get_current_vm`), and
+/// wakes it with `sev`. Returns the PSCI return code to place in x0 (0 =
+/// SUCCESS, or a negative PSCI error code).
+fn handle_guest_cpu_on(target_cpu: u64, entry_point: usize, context_id: usize) -> u64 {
+    const PSCI_ALREADY_ON: u64 = (-4i32) as u32 as u64;
+
+    let target_affinity = asm::mpidr_to_affinity(target_cpu);
+    let mut parked_cpus = PARKED_CPUS.lock();
+    let Some(index) = parked_cpus
+        .iter()
+        .position(|cpu| cpu.affinity == target_affinity)
+    else {
+        /* Either an unknown affinity, or this CPU was already claimed by
+         * an earlier CPU_ON (this hypervisor never reports a vCPU back to
+         * the parked pool once claimed, so "not parked" always means
+         * "already on" here). */
+        return PSCI_ALREADY_ON;
+    };
+    let mut list_tail = parked_cpus.split_off(index);
+    let cpu = list_tail.pop_front().unwrap();
+    parked_cpus.append(&mut list_tail);
+    drop(parked_cpus);
+
+    *cpu.launch.lock() = Some(SmpLaunchRequest {
+        vm: vm::get_current_vm(),
+        entry_point,
+        context_id,
+    });
+    unsafe { asm::sev() };
+    0 /* PSCI_SUCCESS */
+}
+
 pub fn launch_cpu() -> bool {
     let dtb = unsafe { (&raw const DTB).as_ref().unwrap().assume_init_ref() };
     let mut cpu_node = None;
@@ -864,7 +1082,11 @@ pub fn launch_cpu() -> bool {
                     "Starting CPU(Affinity: {:#X}) via spin-table (release address: {:#X})",
                     affinity, release_address
                 );
-                psci::spin_table_cpu_on(release_address, stack_address as u64);
+                psci::spin_table_cpu_on(
+                    release_address,
+                    stack_address as u64,
+                    asm::core_entry as *const () as u64,
+                );
                 return true;
             }
             match psci::cpu_on(

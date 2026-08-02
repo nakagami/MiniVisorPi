@@ -17,6 +17,13 @@ pub const HCR_EL2_AMO: u64 = 1 << 5;
 pub const HCR_EL2_IMO: u64 = 1 << 4;
 pub const HCR_EL2_FMO: u64 = 1 << 3;
 pub const HCR_EL2_VM: u64 = 1 << 0;
+/// Trap guest (EL1/EL0) SMC instructions to EL2 instead of EL3. This DTB's
+/// `psci` node advertises `method = "smc"`, so the guest kernel invokes
+/// PSCI (including its own CPU_ON calls to bring up additional vCPUs) via
+/// SMC; trapping it here lets the hypervisor virtualize CPU_ON for true
+/// guest SMP (see `main::handle_guest_smc`) while transparently forwarding
+/// every other PSCI call to the real firmware.
+pub const HCR_EL2_TSC: u64 = 1 << 19;
 
 /* SPSR_EL2 */
 pub const SPSR_EL2_M_EL1H: u64 = 0b0101;
@@ -54,6 +61,11 @@ pub const ESR_EL2_EC_DATA_ABORT: u64 = 0b100100 << 26;
 /// EC value for a trapped WFI/WFE instruction (Arm ARM: "Trapped WFI or WFE"). Used
 /// with HCR_EL2.TWI so guest WFI becomes a UART-polling hook (see HCR_EL2_TWI).
 pub const ESR_EL2_EC_WFX: u64 = 0b000001 << 26;
+/// EC value for a trapped SMC instruction executed in AArch64 state (Arm
+/// ARM: "SMC instruction execution in AArch64 state"). Used with
+/// HCR_EL2.TSC to virtualize the guest's own PSCI calls (see
+/// `main::handle_guest_smc`), most importantly CPU_ON for guest SMP.
+pub const ESR_EL2_EC_SMC64: u64 = 0b010111 << 26;
 pub const ESR_EL2_ISS_ISV: u64 = 1 << 24;
 pub const ESR_EL2_ISS_SAS_BITS_OFFSET: u64 = 22;
 pub const ESR_EL2_ISS_SAS: u64 = 0b11 << ESR_EL2_ISS_SAS_BITS_OFFSET;
