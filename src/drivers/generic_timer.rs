@@ -44,11 +44,6 @@ pub fn init_generic_timer_local(distributor: &gicv2::GicDistributor) {
 /// itself, or this pCPU's timer is dead for good.
 #[must_use]
 pub fn generic_timer_interrupt_handler() -> bool {
-    static TICK_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    let ticks = TICK_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    if ticks % 1000 == 0 {
-        println!("generic_timer: heartbeat tick={ticks}");
-    }
     /* The Generic Timer's interrupt is a PPI: banked, per-physical-CPU hardware, so this
      * handler always runs on the very pCPU whose own local timer just fired. The resulting
      * virtual timer tick must go to *that* pCPU's own vCPU, not always `own_target` (which
