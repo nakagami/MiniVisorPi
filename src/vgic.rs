@@ -73,16 +73,31 @@ pub fn add_virtual_interrupt(entry: u32) -> bool {
     let number_of_lrn = gicv2::get_gich_vtr_list_regs();
     let supported_lrn = number_of_lrn.min(NUMBER_OF_SUPPORTED_LRS);
 
+    /* First pass: if this INTID already has an entry in some LR (pending, active, or
+     * both), it must be merged into that same LR rather than allocated a fresh one.
+     * A free LR at a lower index must NOT shadow a later LR already holding this INTID,
+     * otherwise the same virtual interrupt ends up duplicated across two LRs, wasting a
+     * List Register and eventually starving unrelated interrupts (e.g. the virtual timer)
+     * once all LRs fill up with such duplicates. */
+    for i in 0..supported_lrn {
+        let gich_lrn = gicv2::get_gich_lr(i);
+        if (gich_lrn & GICH_LR_STATE) != GICH_LR_STATE_INACTIVE
+            && (gich_lrn & GICH_LR_VIRTUAL_ID) == (entry & GICH_LR_VIRTUAL_ID)
+        {
+            gicv2::set_gich_lr(i, gich_lrn | GICH_LR_STATE_PENDING);
+            return true;
+        }
+    }
+
+    /* Second pass: no existing entry for this INTID, so claim the first free LR. */
     for i in 0..supported_lrn {
         let gich_lrn = gicv2::get_gich_lr(i);
         if (gich_lrn & GICH_LR_STATE) == GICH_LR_STATE_INACTIVE {
             gicv2::set_gich_lr(i, entry);
             return true;
-        } else if (gich_lrn & GICH_LR_VIRTUAL_ID) == (entry & GICH_LR_VIRTUAL_ID) {
-            gicv2::set_gich_lr(i, gich_lrn | GICH_LR_STATE_PENDING);
-            return true;
         }
     }
+
     println!("GICH_LR is overflowed.");
     false
 }
