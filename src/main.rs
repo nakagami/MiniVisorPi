@@ -1096,33 +1096,43 @@ fn handle_guest_cpu_on(target_cpu: u64, entry_point: usize, context_id: usize) -
 /// Services a guest-issued PSCI CPU_OFF (see [`handle_guest_smc`]),
 /// virtualizing it the same way [`handle_guest_cpu_on`] virtualizes CPU_ON,
 /// instead of forwarding it to the real firmware and permanently powering
-/// off this physical CPU: retires the calling VCPU (see
-/// `vm::retire_current_vcpu`) so it is never scheduled again, then either
-/// -- if another VCPU is already queued on this same pCPU (e.g. from an
-/// earlier `create_vm` queueing or another guest-issued CPU_ON) -- switches
-/// straight to it (`vm::switch_to_sibling_vcpu_after_retire`), letting the
-/// exception epilogue `eret` into that VCPU instead of the one that issued
-/// this CPU_OFF; or, if this was the only VCPU on this pCPU, re-parks the
-/// physical CPU (`asm::reset_stack_and_park`) so a future guest-issued
-/// CPU_ON can reclaim it, exactly like it was before ever being claimed by
-/// [`handle_guest_cpu_on`].
+/// off this physical CPU: either -- if another, independent VM is already
+/// queued on this same pCPU (under the debug `boot`/`spawn` console
+/// commands' separate-VM-per-pCPU model, see
+/// `vm::find_other_same_affinity_vcpu`) -- switches straight to it
+/// (`vm::switch_to_other_vcpu_on_retire`), letting the exception epilogue
+/// `eret` into that VM instead of the VCPU that issued this CPU_OFF; or, if
+/// none is queued, re-parks the physical CPU (`asm::reset_stack_and_park`)
+/// so a future guest-issued CPU_ON can reclaim it, exactly like it was
+/// before ever being claimed by [`handle_guest_cpu_on`].
+///
+/// Deliberately does *not* remove this VCPU's `VM_LIST` entry (unlike an
+/// earlier, buggy version of this function): for a true-SMP guest, every
+/// physical CPU that joined this same VM via
+/// `vm::activate_vm_on_this_pcpu` (i.e. every additional vCPU brought up
+/// via [`handle_guest_cpu_on`]) shares that *one* `VM_LIST` entry, so
+/// deleting it here -- just because *this* pCPU happens to be retiring --
+/// would leave every other, still-actively-running pCPU's next
+/// `vm::get_current_vm()` (keyed by that same now-missing `vm_id`)
+/// panicking. See `vm::switch_to_other_vcpu_on_retire`'s doc comment for
+/// the full reasoning.
 ///
 /// Never returns to the caller: per the PSCI spec, CPU_OFF only returns a
 /// value on failure, and this virtualized implementation cannot fail.
 fn handle_guest_cpu_off(registers: &mut exception::Registers) {
-    vm::retire_current_vcpu();
+    let retiring_vm_id = asm::get_tpidr_el2() as usize;
 
-    if vm::switch_to_sibling_vcpu_after_retire(registers) {
-        /* `registers`/ELR_EL2/SPSR_EL2 now hold the sibling VCPU's already
+    if vm::switch_to_other_vcpu_on_retire(retiring_vm_id, registers) {
+        /* `registers`/ELR_EL2/SPSR_EL2 now hold the other VM's already
          * correctly-positioned resume state, so just let this function
          * return normally: the caller (`handle_guest_smc`) must NOT advance
          * ELR_EL2 again afterwards, since that would incorrectly skip an
-         * instruction of the *sibling* VCPU we just switched to rather than
-         * the retired one that actually issued this CPU_OFF. */
+         * instruction of the VM we just switched to rather than the one
+         * that actually issued this CPU_OFF. */
         return;
     }
 
-    /* No other VCPU is queued on this pCPU: re-park it exactly as
+    /* No other VM is queued on this pCPU: re-park it exactly as
      * `park_secondary_cpus_for_smp` originally did, awaiting a future
      * guest-issued CPU_ON. Resetting `sp` back to this pCPU's original
      * stack top (instead of just calling `smp_park_main()` from here)

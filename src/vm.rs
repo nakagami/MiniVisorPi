@@ -662,9 +662,35 @@ fn setup_hypervisor_registers() {
 /// banked per physical CPU by hardware, so, unlike [`create_vm`], this must
 /// run once on *every* pCPU that will execute a vCPU of `vm`, not just once
 /// per VM.
+///
+/// Also disables this pCPU's EL1 MMU (`SCTLR_EL1.M`) before letting the
+/// new VCPU run. This matters most when this pCPU is being *reclaimed*
+/// after an earlier guest-issued PSCI CPU_OFF (see
+/// `main::handle_guest_cpu_off`): unlike the debug boot/spawn model, this
+/// physical CPU keeps running (it never truly powers off), so without this
+/// it would still have the *retired* VCPU's SCTLR_EL1 programmed into
+/// hardware, MMU still enabled, with TTBR0/1_EL1 pointing at that retired
+/// VCPU's (guest-physical, Stage 2 translated) page tables. The new VCPU's
+/// entry point, though, is a real guest kernel's secondary-CPU entry
+/// trampoline, which (like on genuine hardware, per the PSCI spec's
+/// implementation-defined "reset state" requirement for a newly-online
+/// CPU) always assumes it starts with the MMU disabled -- so leaving it
+/// enabled makes the very first fetch at the new entry point walk the
+/// stale page tables (typically failing outright, since kernel VA ranges
+/// are never identity-mapped) instead of being treated as a raw
+/// (Stage-2-translated) physical address, corrupting guest execution
+/// before it even begins. Every other EL0/EL1 register is deliberately
+/// left alone: unlike `create_vm`'s freshly queued debug-model VCPUs (see
+/// [`El1Context`]/[`reset_el1_context`]), this pCPU's hardware is not
+/// necessarily in the same state moment-to-moment as another pCPU's own
+/// pristine boot state was, and forcing the rest of that unrelated
+/// snapshot onto it (attempted, then reverted, during initial development
+/// of this function) broke ordinary first-time SMP bring-up.
 pub fn activate_vm_on_this_pcpu(vm: &Arc<VM>) {
     setup_hypervisor_registers();
     set_vtcr_el2_for_this_pcpu();
+    const SCTLR_EL1_M: u64 = 1 << 0;
+    unsafe { asm::set_sctlr_el1(asm::get_sctlr_el1() & !SCTLR_EL1_M) };
     activate_stage2_translation_table(vm.stage2_table_address, vm.vmid);
     unsafe { asm::set_tpidr_el2(vm.vm_id as u64) };
 }
@@ -705,30 +731,6 @@ pub fn switch_active_vm(vm_id: usize) -> bool {
     }
 }
 
-/// Permanently removes the currently-running VCPU (i.e. whichever VM
-/// `tpidr_el2` currently identifies on this pCPU) from scheduling, e.g.
-/// because the guest issued a PSCI CPU_OFF for it (see
-/// `main::handle_guest_cpu_off`). After this call, this VCPU is no longer
-/// discoverable via `get_current_vm`, `switch_active_vm`, or the
-/// cooperative scheduler (`find_next_same_affinity_vcpu`/
-/// `find_any_same_affinity_vcpu`) -- it will never run again.
-///
-/// The caller must not resume this VCPU's own context afterwards (e.g. by
-/// falling through to the normal exception epilogue with its trap frame
-/// unmodified); it must instead switch to another VCPU
-/// (`switch_to_sibling_vcpu_after_retire`) or re-park this physical CPU.
-pub fn retire_current_vcpu() {
-    let vm_id = asm::get_tpidr_el2() as usize;
-    let mut vm_list = VM_LIST.lock();
-    let mut remaining = LinkedList::new();
-    while let Some(vm) = vm_list.pop_front() {
-        if vm.vm_id != vm_id {
-            remaining.push_back(vm);
-        }
-    }
-    *vm_list = remaining;
-}
-
 /// Finds the VCPU that should run next on the *current* pCPU after
 /// `current_vm_id` yields, by round-robining among every VM whose
 /// `owner_affinity` matches this pCPU (i.e. every VCPU ever created on it,
@@ -748,34 +750,57 @@ fn find_next_same_affinity_vcpu(current_vm_id: usize, affinity: u64) -> Option<A
     Some(candidates[(position + 1) % candidates.len()].clone())
 }
 
-/// Finds any VCPU sharing physical CPU `affinity`, if one exists. Used by
-/// [`switch_to_sibling_vcpu_after_retire`] after a guest PSCI CPU_OFF has
-/// already retired this pCPU's previously-current VCPU (see
-/// `retire_current_vcpu`): unlike [`find_next_same_affinity_vcpu`]'s
-/// round-robin (which must skip over the *current*, still-live VCPU),
-/// there is no current VCPU left to exclude here, so any match is fine.
-fn find_any_same_affinity_vcpu(affinity: u64) -> Option<Arc<VM>> {
+/// Finds a VM/VCPU queued on physical CPU `affinity` other than
+/// `retiring_vm_id`, if one exists. Used by
+/// [`switch_to_other_vcpu_on_retire`] for a guest PSCI CPU_OFF
+/// (`main::handle_guest_cpu_off`).
+///
+/// This only ever matches an independent VM created via the debug
+/// `boot`/`spawn` console commands' separate-VM-per-pCPU model
+/// (`create_vm`, which sets `owner_affinity` to the pCPU it was created
+/// on) queued behind `retiring_vm_id` on this same pCPU: a true-SMP VCPU
+/// joined via [`activate_vm_on_this_pcpu`] (guest-issued PSCI CPU_ON,
+/// [`main::handle_guest_cpu_on`]) shares its VM's *original* owner's
+/// `owner_affinity` and never gets its own `VM_LIST` entry, so it can
+/// never be found here either as `retiring_vm_id` or as a candidate --
+/// which is exactly why callers must not delete `retiring_vm_id`'s
+/// `VM_LIST` entry when retiring it (see [`switch_to_other_vcpu_on_retire`]
+/// doc comment): unlike the debug model, that entry is very likely still
+/// concurrently in active use by *other* physical CPUs that joined the
+/// same VM via `activate_vm_on_this_pcpu`.
+fn find_other_same_affinity_vcpu(retiring_vm_id: usize, affinity: u64) -> Option<Arc<VM>> {
     VM_LIST
         .lock()
         .iter()
-        .find(|vm| vm.owner_affinity == affinity)
+        .find(|vm| vm.owner_affinity == affinity && vm.vm_id != retiring_vm_id)
         .cloned()
 }
 
-/// Switches the current pCPU directly to another VCPU already queued on it,
-/// after this pCPU's previously-current VCPU has already been retired (see
-/// `retire_current_vcpu`), e.g. for a guest PSCI CPU_OFF
-/// (`main::handle_guest_cpu_off`). Unlike [`try_yield_to_next_vcpu`], there
-/// is no outgoing context to save -- the retired VCPU is gone for good --
-/// so this only restores the target VCPU's previously-saved context into
-/// `registers`/ELR_EL2/SPSR_EL2.
+/// Switches the current pCPU directly to another VM/VCPU already queued on
+/// it (under the debug `boot`/`spawn` console commands' separate-VM model),
+/// after a guest PSCI CPU_OFF (`main::handle_guest_cpu_off`) decides to
+/// retire whichever VCPU is currently running here (`retiring_vm_id`, its
+/// `tpidr_el2`).
+///
+/// Deliberately never removes `retiring_vm_id`'s own `VM_LIST` entry --
+/// unlike [`try_yield_to_next_vcpu`]'s cooperative yield (which always
+/// resumes its outgoing VCPU later), a retired VCPU is never resumed, but
+/// for a true-SMP guest (every physical CPU sharing one VM via
+/// [`activate_vm_on_this_pcpu`], see [`find_other_same_affinity_vcpu`]),
+/// `retiring_vm_id`'s `VM_LIST` entry is very likely still the *same*
+/// entry other physical CPUs are concurrently, actively running the guest
+/// on -- removing it here (as an earlier, buggy version of this function
+/// did) would make every one of *those* pCPUs' next `get_current_vm()` (or
+/// similar `VM_LIST` lookup by `vm_id`) panic. Leaving a genuinely
+/// standalone debug-model VM's now-unreachable entry allocated is a
+/// comparatively harmless memory-bookkeeping cost by contrast.
 ///
 /// Returns `false` (leaving `registers`/ELR_EL2/SPSR_EL2 untouched) if no
 /// other VCPU is queued on this pCPU, in which case the caller must instead
 /// re-park this physical CPU.
-pub fn switch_to_sibling_vcpu_after_retire(registers: &mut Registers) -> bool {
+pub fn switch_to_other_vcpu_on_retire(retiring_vm_id: usize, registers: &mut Registers) -> bool {
     let affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
-    let Some(next) = find_any_same_affinity_vcpu(affinity) else {
+    let Some(next) = find_other_same_affinity_vcpu(retiring_vm_id, affinity) else {
         return false;
     };
 
