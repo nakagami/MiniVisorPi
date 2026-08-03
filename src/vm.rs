@@ -705,6 +705,30 @@ pub fn switch_active_vm(vm_id: usize) -> bool {
     }
 }
 
+/// Permanently removes the currently-running VCPU (i.e. whichever VM
+/// `tpidr_el2` currently identifies on this pCPU) from scheduling, e.g.
+/// because the guest issued a PSCI CPU_OFF for it (see
+/// `main::handle_guest_cpu_off`). After this call, this VCPU is no longer
+/// discoverable via `get_current_vm`, `switch_active_vm`, or the
+/// cooperative scheduler (`find_next_same_affinity_vcpu`/
+/// `find_any_same_affinity_vcpu`) -- it will never run again.
+///
+/// The caller must not resume this VCPU's own context afterwards (e.g. by
+/// falling through to the normal exception epilogue with its trap frame
+/// unmodified); it must instead switch to another VCPU
+/// (`switch_to_sibling_vcpu_after_retire`) or re-park this physical CPU.
+pub fn retire_current_vcpu() {
+    let vm_id = asm::get_tpidr_el2() as usize;
+    let mut vm_list = VM_LIST.lock();
+    let mut remaining = LinkedList::new();
+    while let Some(vm) = vm_list.pop_front() {
+        if vm.vm_id != vm_id {
+            remaining.push_back(vm);
+        }
+    }
+    *vm_list = remaining;
+}
+
 /// Finds the VCPU that should run next on the *current* pCPU after
 /// `current_vm_id` yields, by round-robining among every VM whose
 /// `owner_affinity` matches this pCPU (i.e. every VCPU ever created on it,
@@ -722,6 +746,51 @@ fn find_next_same_affinity_vcpu(current_vm_id: usize, affinity: u64) -> Option<A
     }
     let position = candidates.iter().position(|vm| vm.vm_id == current_vm_id)?;
     Some(candidates[(position + 1) % candidates.len()].clone())
+}
+
+/// Finds any VCPU sharing physical CPU `affinity`, if one exists. Used by
+/// [`switch_to_sibling_vcpu_after_retire`] after a guest PSCI CPU_OFF has
+/// already retired this pCPU's previously-current VCPU (see
+/// `retire_current_vcpu`): unlike [`find_next_same_affinity_vcpu`]'s
+/// round-robin (which must skip over the *current*, still-live VCPU),
+/// there is no current VCPU left to exclude here, so any match is fine.
+fn find_any_same_affinity_vcpu(affinity: u64) -> Option<Arc<VM>> {
+    VM_LIST
+        .lock()
+        .iter()
+        .find(|vm| vm.owner_affinity == affinity)
+        .cloned()
+}
+
+/// Switches the current pCPU directly to another VCPU already queued on it,
+/// after this pCPU's previously-current VCPU has already been retired (see
+/// `retire_current_vcpu`), e.g. for a guest PSCI CPU_OFF
+/// (`main::handle_guest_cpu_off`). Unlike [`try_yield_to_next_vcpu`], there
+/// is no outgoing context to save -- the retired VCPU is gone for good --
+/// so this only restores the target VCPU's previously-saved context into
+/// `registers`/ELR_EL2/SPSR_EL2.
+///
+/// Returns `false` (leaving `registers`/ELR_EL2/SPSR_EL2 untouched) if no
+/// other VCPU is queued on this pCPU, in which case the caller must instead
+/// re-park this physical CPU.
+pub fn switch_to_sibling_vcpu_after_retire(registers: &mut Registers) -> bool {
+    let affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
+    let Some(next) = find_any_same_affinity_vcpu(affinity) else {
+        return false;
+    };
+
+    let (next_elr_el2, next_spsr_el2) = next.restore_context(registers);
+    /* Make the target VCPU's own Stage 2 mappings live before resuming it;
+     * its unique VMID means this never requires a TLB flush (see
+     * `paging::activate_stage2_translation_table`). */
+    activate_stage2_translation_table(next.stage2_table_address, next.vmid);
+    unsafe {
+        asm::set_elr_el2(next_elr_el2);
+        asm::set_spsr_el2(next_spsr_el2);
+        asm::set_tpidr_el2(next.vm_id as u64);
+    }
+    *ACTIVE_VM.lock() = Some(next.clone());
+    true
 }
 
 /// Cooperatively switches the current pCPU from the currently running VCPU

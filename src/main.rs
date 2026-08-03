@@ -55,6 +55,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::collections::linked_list::LinkedList;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 struct GlobalAllocator {}
 
@@ -127,6 +128,15 @@ struct SmpLaunchRequest {
 }
 
 static PARKED_CPUS: Mutex<LinkedList<Arc<ParkedCpu>>> = Mutex::new(LinkedList::new());
+
+/// Per-pCPU stack top addresses (as originally handed to
+/// [`asm::smp_park_entry`]/[`psci::spin_table_cpu_on`] by
+/// [`park_secondary_cpus_for_smp`]), keyed by that pCPU's MPIDR-derived
+/// affinity. Looked back up by [`handle_guest_cpu_off`] to cleanly re-park
+/// a physical CPU (via [`asm::reset_stack_and_park`]) after a guest PSCI
+/// CPU_OFF retires its last VCPU, without leaking stack across repeated
+/// CPU_OFF/CPU_ON cycles.
+static STACK_TOPS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 
 
 /// Constants
@@ -931,6 +941,7 @@ fn park_secondary_cpus_for_smp(dtb: &dtb::Dtb, has_psci: bool) {
                     stack_address as u64,
                     asm::smp_park_entry as *const () as u64,
                 );
+                STACK_TOPS.lock().push((affinity, stack_address as u64));
             } else if has_psci {
                 match psci::cpu_on(
                     affinity,
@@ -939,6 +950,7 @@ fn park_secondary_cpus_for_smp(dtb: &dtb::Dtb, has_psci: bool) {
                 ) {
                     Ok(_) => {
                         println!("Parking CPU(Affinity: {:#X}) for guest SMP via PSCI", affinity);
+                        STACK_TOPS.lock().push((affinity, stack_address as u64));
                     }
                     Err(e) => {
                         println!(
@@ -1016,22 +1028,33 @@ extern "C" fn smp_park_main() -> ! {
 }
 
 /// Virtualizes the guest's own PSCI SMC calls (trapped via HCR_EL2.TSC,
-/// since this DTB's `psci` node advertises `method = "smc"`). Only CPU_ON
-/// is actually virtualized, to let the guest kernel bring up additional
-/// vCPUs of *this same* VM on the physical CPUs parked by
-/// [`park_secondary_cpus_for_smp`] -- true multi-vCPU SMP, as opposed to
+/// since this DTB's `psci` node advertises `method = "smc"`). CPU_ON and
+/// CPU_OFF are both virtualized, so the guest kernel can bring up and
+/// retire additional vCPUs of *this same* VM on the physical CPUs parked
+/// by [`park_secondary_cpus_for_smp`] -- true multi-vCPU SMP, as opposed to
 /// the `boot`/`spawn` debug console commands' separate-VM-per-pCPU model.
-/// Every other PSCI function (SYSTEM_OFF, SYSTEM_RESET, CPU_OFF, version
-/// queries, ...) is passed through to the real firmware unmodified, e.g.
-/// so a guest-issued shutdown/reboot still powers off/resets real
-/// hardware.
+/// Every other PSCI function (SYSTEM_OFF, SYSTEM_RESET, version queries,
+/// ...) is passed through to the real firmware unmodified, e.g. so a
+/// guest-issued shutdown/reboot still powers off/resets real hardware.
 pub fn handle_guest_smc(registers: &mut exception::Registers) {
-    registers.x0 = if registers.x0 == psci::PSCI_CPU_ON {
-        handle_guest_cpu_on(registers.x1, registers.x2 as usize, registers.x3 as usize)
+    if registers.x0 == psci::PSCI_CPU_ON {
+        registers.x0 =
+            handle_guest_cpu_on(registers.x1, registers.x2 as usize, registers.x3 as usize);
+        unsafe { asm::advance_elr_el2() };
+    } else if registers.x0 == psci::PSCI_CPU_OFF {
+        /* Never actually returns here: `handle_guest_cpu_off` either directly
+         * substitutes `registers`/ELR_EL2/SPSR_EL2 with another queued VCPU's
+         * context (so the shared exception epilogue erets into *that* VCPU
+         * instead of advancing past this one, which no longer exists), or
+         * diverges entirely to re-park this physical CPU. Either way, the
+         * calling VCPU's own CPU_OFF never "returns" a value to it, per the
+         * PSCI spec (CPU_OFF only returns to the caller on failure, which
+         * this hypervisor's virtualized version cannot produce). */
+        handle_guest_cpu_off(registers);
     } else {
-        unsafe { asm::smc(registers.x0, registers.x1, registers.x2, registers.x3) }
-    };
-    unsafe { asm::advance_elr_el2() };
+        registers.x0 = unsafe { asm::smc(registers.x0, registers.x1, registers.x2, registers.x3) };
+        unsafe { asm::advance_elr_el2() };
+    }
 }
 
 /// Services a guest-issued PSCI CPU_ON (see [`handle_guest_smc`]): finds
@@ -1068,6 +1091,51 @@ fn handle_guest_cpu_on(target_cpu: u64, entry_point: usize, context_id: usize) -
     });
     unsafe { asm::sev() };
     0 /* PSCI_SUCCESS */
+}
+
+/// Services a guest-issued PSCI CPU_OFF (see [`handle_guest_smc`]),
+/// virtualizing it the same way [`handle_guest_cpu_on`] virtualizes CPU_ON,
+/// instead of forwarding it to the real firmware and permanently powering
+/// off this physical CPU: retires the calling VCPU (see
+/// `vm::retire_current_vcpu`) so it is never scheduled again, then either
+/// -- if another VCPU is already queued on this same pCPU (e.g. from an
+/// earlier `create_vm` queueing or another guest-issued CPU_ON) -- switches
+/// straight to it (`vm::switch_to_sibling_vcpu_after_retire`), letting the
+/// exception epilogue `eret` into that VCPU instead of the one that issued
+/// this CPU_OFF; or, if this was the only VCPU on this pCPU, re-parks the
+/// physical CPU (`asm::reset_stack_and_park`) so a future guest-issued
+/// CPU_ON can reclaim it, exactly like it was before ever being claimed by
+/// [`handle_guest_cpu_on`].
+///
+/// Never returns to the caller: per the PSCI spec, CPU_OFF only returns a
+/// value on failure, and this virtualized implementation cannot fail.
+fn handle_guest_cpu_off(registers: &mut exception::Registers) {
+    vm::retire_current_vcpu();
+
+    if vm::switch_to_sibling_vcpu_after_retire(registers) {
+        /* `registers`/ELR_EL2/SPSR_EL2 now hold the sibling VCPU's already
+         * correctly-positioned resume state, so just let this function
+         * return normally: the caller (`handle_guest_smc`) must NOT advance
+         * ELR_EL2 again afterwards, since that would incorrectly skip an
+         * instruction of the *sibling* VCPU we just switched to rather than
+         * the retired one that actually issued this CPU_OFF. */
+        return;
+    }
+
+    /* No other VCPU is queued on this pCPU: re-park it exactly as
+     * `park_secondary_cpus_for_smp` originally did, awaiting a future
+     * guest-issued CPU_ON. Resetting `sp` back to this pCPU's original
+     * stack top (instead of just calling `smp_park_main()` from here)
+     * avoids leaking this trap's exception frame and call stack on every
+     * such CPU_OFF/CPU_ON cycle. */
+    let affinity = asm::mpidr_to_affinity(asm::get_mpidr_el1());
+    let stack_top = STACK_TOPS
+        .lock()
+        .iter()
+        .find(|(cpu_affinity, _)| *cpu_affinity == affinity)
+        .map(|(_, stack_top)| *stack_top)
+        .expect("Re-parking CPU with no recorded stack top");
+    asm::reset_stack_and_park(stack_top);
 }
 
 pub fn launch_cpu() -> bool {

@@ -278,6 +278,32 @@ pub extern "C" fn smp_park_entry() -> ! {
     )
 }
 
+/// Re-parks the current physical CPU (see `main::smp_park_main`) after a
+/// guest-issued PSCI CPU_OFF has retired the VCPU it was running (see
+/// `main::handle_guest_cpu_off`), when no other queued VCPU on this same
+/// pCPU is available to switch to immediately.
+///
+/// Resets `sp` to `stack_top` (the same per-pCPU stack top address this
+/// physical CPU was originally started on, e.g. by
+/// `main::park_secondary_cpus_for_smp`) before re-entering
+/// [`crate::smp_park_main`], rather than simply calling it as an ordinary
+/// Rust function from deep inside the CPU_OFF trap's call stack. Re-running
+/// `smp_park_main`'s (idempotent) setup is harmless, but never popping the
+/// exception frame and call stack accumulated up to that point would leak
+/// a little of this pCPU's stack on every such CPU_OFF/CPU_ON cycle,
+/// eventually overflowing it (e.g. under a guest that repeatedly
+/// hotplugs/hotunplugs the same vCPU) -- resetting `sp` here avoids that
+/// entirely, exactly like this physical CPU's original park entry
+/// ([`smp_park_entry`]) does.
+#[unsafe(naked)]
+pub extern "C" fn reset_stack_and_park(_stack_top: u64) -> ! {
+    naked_asm!("
+            mov sp, x0
+            b   {}",
+        sym crate::smp_park_main
+    )
+}
+
 /// Data Synchronization Barrier (waits for prior memory accesses to complete).
 pub unsafe fn dsb_sy() {
     unsafe { asm!("dsb sy") };

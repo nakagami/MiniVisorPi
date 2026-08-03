@@ -14,6 +14,18 @@ const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 /// additional vCPU for true guest SMP.
 pub(crate) const PSCI_CPU_ON: u64 = 0xC400_0003;
 
+/// PSCI CPU_OFF function ID. Unlike CPU_ON, CPU_OFF takes no arguments that
+/// need widening to 64 bits, so the spec defines only a single ID shared by
+/// both the SMC32 and SMC64 calling conventions (no `0x4000_0000` bit).
+/// Also the function ID an AArch64 guest kernel issues to *this* hypervisor
+/// (trapped via HCR_EL2.TSC, see `main::handle_guest_smc`) to retire one of
+/// its own vCPUs, e.g. during CPU hotplug or shutdown/reboot -- the
+/// counterpart to [`PSCI_CPU_ON`] that lets the physical CPU it was running
+/// on be reclaimed (either handed straight to another queued vCPU, or
+/// re-parked to await a future CPU_ON) instead of powering off real
+/// hardware.
+pub(crate) const PSCI_CPU_OFF: u64 = 0x8400_0002;
+
 /// Stack pointer to hand to a CPU woken up via the ARM "spin-table" boot
 /// protocol (see [`crate::asm::spin_table_entry`]). Must be written just
 /// before [`spin_table_cpu_on`] arms the release address, and is consumed
