@@ -1,0 +1,6 @@
+# Override the repo root's default build target (aarch64-unknown-none-softfloat,
+# a no_std bare-metal target) so this crate's tests build/run for the host
+# instead. Scalar config values like `build.target` are replaced by the
+# closer config file, unlike arrays (e.g. rustflags) which get merged.
+[build]
+target = "x86_64-unknown-linux-gnu"

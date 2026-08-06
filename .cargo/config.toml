@@ -1,9 +1,15 @@
 [build]
 target = "aarch64-unknown-none-softfloat"
-rustflags = ["-C", "link-arg=-Tscripts/qemu.ld"]
 
+# `rustflags` lives here (target-specific) rather than in `[build]` above so
+# that it only applies when actually building for this target. `[build]
+# rustflags` would apply unconditionally to *any* target (e.g. host builds
+# of the allocator_tests/ crate under x86_64-unknown-linux-gnu), injecting
+# a `-Tscripts/qemu.ld` linker argument that doesn't resolve relative to
+# other crate directories and breaks `cargo test` there.
 [target.aarch64-unknown-none-softfloat]
 runner="tools/run_qemu.sh"
+rustflags = ["-C", "link-arg=-Tscripts/qemu.ld"]
 
 # `cargo build-pi4` builds mini_visor and copies the resulting ELF into
 # bin-pi4/disk/mini.elf instead of launching QEMU. It is implemented as a
