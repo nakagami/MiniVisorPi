@@ -12,6 +12,22 @@ AArch64向けの小型Type1ハイパーバイザ
 
 書籍と同様の手順で QEMUの環境で動作しますが、`tools-pi4`以下のスクリプトを使うとRaspberry Pi 4実機向けの起動用SDカードイメージを作成できます。
 
+## QEMU環境での動作確認
+
+以下のコマンドでビルド後、自動的にQEMU(`aarch64`, `virt`マシン)上でMiniVisorとゲストLinuxが起動します。
+```
+cargo run
+```
+
+## テストの実行
+
+メモリアロケータ(`memory_allocator`)や仮想GIC/VMの純粋ロジック(`vgic_lr`・`guest_memory`)は、ホスト環境(x86_64)向けの単体テストとして`allocator_tests`クレートに切り出されています。以下のコマンドで実行できます。
+```
+cd allocator_tests
+cargo test
+```
+リポジトリのルートには、MiniVisor本体(no_std/aarch64向け)をビルドするための`.cargo/config.toml`があり、`allocator_tests`はそれを継承しないよう独自の`.cargo/config.toml`でビルドターゲットをホスト側に上書きしています。
+
 ## Raspberry Pi 4実機向けブートイメージの作成手順
 
 1. u-boot(実機向け、`rpi_arm64_defconfig`)をビルドします。
@@ -44,6 +60,11 @@ AArch64向けの小型Type1ハイパーバイザ
    sudo dd if=bin-pi4/disk.img of=/dev/sdX bs=4M status=progress conv=fsync
    ```
 7. SDカードもしくは USB メモリをRaspberry Pi 4に挿して起動します。
+
+## 既知の制限事項
+
+- USB3ホストコントローラ(VL805)向けのxHCIドライバ(`src/drivers/xhci.rs`)は、レジスタ配置やリング/コンテキストの構成をRaspberry Pi 4のU-Boot自身のxHCIスタックに合わせて実装したものですが、実機での動作検証はまだ行っていません。
+- ゲスト向けストレージはVirtio-Blk/SDHCI/USB Mass Storageの検出に対応していますが、それ以外のブロックデバイスは未対応です。
 
 ## ライセンスについて
 本ソフトウェアはApache License, Version 2.0にてライセンスされています。
