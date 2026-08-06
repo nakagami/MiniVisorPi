@@ -4,3 +4,9 @@ pub mod paging {
 
 #[path = "../../src/memory_allocator.rs"]
 pub mod memory_allocator;
+
+#[path = "../../src/vgic_lr.rs"]
+pub mod vgic_lr;
+
+#[path = "../../src/guest_memory.rs"]
+pub mod guest_memory;

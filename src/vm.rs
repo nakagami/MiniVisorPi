@@ -355,13 +355,12 @@ impl VM {
     }
 
     pub fn get_physical_address(&self, virtual_address: usize) -> Option<usize> {
-        if (self.ram_virtual_base_address..(self.ram_virtual_base_address + self.ram_size))
-            .contains(&virtual_address)
-        {
-            Some(virtual_address - self.ram_virtual_base_address + self.ram_physical_base_address)
-        } else {
-            None
-        }
+        crate::guest_memory::translate_guest_physical_address(
+            virtual_address,
+            self.ram_virtual_base_address,
+            self.ram_physical_base_address,
+            self.ram_size,
+        )
     }
 
     pub fn get_gic_distributor_mmio(&self) -> &Mutex<GicDistributorMmio> {

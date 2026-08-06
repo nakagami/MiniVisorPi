@@ -5,27 +5,28 @@
 use crate::drivers::gicv2;
 use crate::drivers::gicv2::{GicDistributor, GicGroup, GicHypervisorInterface};
 use crate::mmio::gicv2::INJECT_INTERRUPT_INT_ID;
+use crate::vgic_lr;
 use crate::vm;
 
 pub const MAINTENANCE_INTERRUPT_INTID: u32 = 25;
 
-/* Fields (32-bit) of the GICv2 GICH_LR (List Register) */
+/* Fields (32-bit) of the GICv2 GICH_LR (List Register) that this module still
+ * needs to read back (see `add_virtual_interrupt`/`maintenance_interrupt_handler`
+ * below); the bit-packing logic that *builds* an entry from scratch has been
+ * moved to the pure, host-testable `vgic_lr` module. */
 const GICH_LR_VIRTUAL_ID: u32 = (1 << 10) - 1;
-const GICH_LR_PHYSICAL_ID_OFFSET: u32 = 10;
-const GICH_LR_PHYSICAL_ID: u32 = ((1 << 10) - 1) << GICH_LR_PHYSICAL_ID_OFFSET;
-const GICH_LR_EOI_OFFSET: u32 = 19;
-const GICH_LR_EOI: u32 = 1 << GICH_LR_EOI_OFFSET;
-const GICH_LR_PRIORITY_OFFSET: u32 = 23;
 const GICH_LR_STATE_OFFSET: u32 = 28;
 const GICH_LR_STATE: u32 = 0b11 << GICH_LR_STATE_OFFSET;
 const GICH_LR_STATE_INACTIVE: u32 = 0b00 << GICH_LR_STATE_OFFSET;
 const GICH_LR_STATE_PENDING: u32 = 0b01 << GICH_LR_STATE_OFFSET;
-const GICH_LR_GROUP1_OFFSET: u32 = 30;
-const GICH_LR_HW_OFFSET: u32 = 31;
-const GICH_LR_HW: u32 = 1 << GICH_LR_HW_OFFSET;
 
-/* Maximum number of List Registers used by this hypervisor */
+/// Maximum number of List Registers used by this hypervisor.
 pub const NUMBER_OF_SUPPORTED_LRS: usize = 4;
+
+/// Re-exported so existing callers (e.g. `mmio::gicv2`) can keep referring to
+/// `vgic::create_list_register_entry` unchanged; the implementation itself
+/// lives in `vgic_lr` so it can be unit-tested on the host.
+pub use vgic_lr::create_list_register_entry;
 
 pub fn init_vgic(gich: &GicHypervisorInterface, distributor: &GicDistributor) {
     gich.init();
@@ -41,24 +42,6 @@ pub fn init_vgic(gich: &GicHypervisorInterface, distributor: &GicDistributor) {
     distributor.set_priority(INJECT_INTERRUPT_INT_ID, 0x00);
     distributor.set_trigger_mode(INJECT_INTERRUPT_INT_ID, false);
     distributor.set_enable(INJECT_INTERRUPT_INT_ID, true);
-}
-
-pub fn create_list_register_entry(
-    int_id: u32,
-    group: u32,
-    priority: u32,
-    physical_int_id: Option<u32>,
-) -> u32 {
-    let mut entry = GICH_LR_STATE_PENDING
-        | (group << GICH_LR_GROUP1_OFFSET)
-        | (((priority >> 3) & 0x1F) << GICH_LR_PRIORITY_OFFSET)
-        | (int_id & GICH_LR_VIRTUAL_ID);
-    if let Some(p_int_id) = physical_int_id {
-        entry |= GICH_LR_HW | ((p_int_id << GICH_LR_PHYSICAL_ID_OFFSET) & GICH_LR_PHYSICAL_ID);
-    } else {
-        entry |= GICH_LR_EOI;
-    }
-    entry
 }
 
 /// Injects `entry` into a free List Register of the current pCPU.

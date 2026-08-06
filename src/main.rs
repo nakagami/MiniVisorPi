@@ -26,6 +26,7 @@ mod drivers {
 mod elf;
 mod exception;
 mod fat32;
+mod guest_memory;
 mod lock;
 mod memory_allocator;
 mod mmio {
@@ -38,6 +39,7 @@ mod paging;
 mod psci;
 mod registers;
 mod vgic;
+mod vgic_lr;
 mod vm;
 
 use block_backend::BlockBackend;
