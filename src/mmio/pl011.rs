@@ -6,11 +6,19 @@ use crate::mmio::gicv2::GicDistributorMmio;
 use crate::vm::MmioHandler;
 
 const UART_DR: usize = 0x000;
+const UART_RSR_ECR: usize = 0x004;
 const UART_FR: usize = 0x018;
+const UART_ILPR: usize = 0x020;
+const UART_IBRD: usize = 0x024;
+const UART_FBRD: usize = 0x028;
+const UART_LCR_H: usize = 0x02C;
 const UART_CR: usize = 0x030;
+const UART_IFLS: usize = 0x034;
 const UART_IMSC: usize = 0x038;
 const UART_RIS: usize = 0x03C;
+const UART_MIS: usize = 0x040;
 const UART_ICR: usize = 0x044;
+const UART_DMACR: usize = 0x048;
 const UART_PERIPH_ID0: usize = 0xFE0;
 const UART_PERIPH_ID1: usize = 0xFE4;
 const UART_PERIPH_ID2: usize = 0xFE8;
@@ -35,6 +43,21 @@ pub struct Pl011Mmio {
     raw_interrupt_status: u16,
     control: u16,
     read_buffer: [u8; 4],
+    /* The following registers have no effect on this emulation's actual
+     * behavior (there is no real baud-rate generator, FIFO depth, or
+     * DMA engine to configure, and this virtual UART never reports a
+     * framing/parity/break/overrun receive error), but Linux's amba-pl011
+     * driver reads back several of them during probe/`set_termios` (e.g.
+     * to verify IBRD/FBRD took effect) and DMA engine drivers probe
+     * UART011_DMACR. Storing and returning whatever the guest last wrote
+     * avoids that stale reads of `0x00` are mistaken for "value rejected"
+     * and avoids the guest's own `dev_err`/retry logic around them. */
+    irda_low_power_counter: u16,
+    integer_baud_rate_divisor: u16,
+    fractional_baud_rate_divisor: u16,
+    line_control: u16,
+    interrupt_fifo_level_select: u16,
+    dma_control: u16,
 }
 
 impl Pl011Mmio {
@@ -45,6 +68,12 @@ impl Pl011Mmio {
             raw_interrupt_status: 0,
             control: 0,
             read_buffer: [0; 4],
+            irda_low_power_counter: 0,
+            integer_baud_rate_divisor: 0,
+            fractional_baud_rate_divisor: 0,
+            line_control: 0,
+            interrupt_fifo_level_select: 0,
+            dma_control: 0,
         }
     }
 
@@ -97,6 +126,37 @@ impl MmioHandler for Pl011Mmio {
             UART_RIS => {
                 value = self.raw_interrupt_status as u64;
             }
+            UART_MIS => {
+                /* Masked Interrupt Status: which raw interrupt sources are both
+                 * pending (RIS) and unmasked (IMSC). Linux's amba-pl011 IRQ
+                 * handler reads this (not RIS) to decide which sources to
+                 * service, so leaving it hardwired to 0 would make the guest
+                 * believe no interrupt was ever actually pending. */
+                value = (self.raw_interrupt_status & self.interrupt_mask) as u64;
+            }
+            UART_RSR_ECR => {
+                /* This virtual UART never produces a framing/parity/break/
+                 * overrun receive error, so there is nothing to report here. */
+                value = 0x00;
+            }
+            UART_ILPR => {
+                value = self.irda_low_power_counter as u64;
+            }
+            UART_IBRD => {
+                value = self.integer_baud_rate_divisor as u64;
+            }
+            UART_FBRD => {
+                value = self.fractional_baud_rate_divisor as u64;
+            }
+            UART_LCR_H => {
+                value = self.line_control as u64;
+            }
+            UART_IFLS => {
+                value = self.interrupt_fifo_level_select as u64;
+            }
+            UART_DMACR => {
+                value = self.dma_control as u64;
+            }
             UART_PERIPH_ID0 => {
                 value = 0x11;
             }
@@ -141,6 +201,30 @@ impl MmioHandler for Pl011Mmio {
             }
             UART_ICR => {
                 self.raw_interrupt_status &= !(value as u16);
+            }
+            UART_RSR_ECR => {
+                /* Write-to-clear for the (always-empty) receive error state;
+                 * nothing to actually clear, but accepting the write instead
+                 * of falling into the unimplemented default avoids surprising
+                 * a guest driver that writes here unconditionally on open. */
+            }
+            UART_ILPR => {
+                self.irda_low_power_counter = value as u16;
+            }
+            UART_IBRD => {
+                self.integer_baud_rate_divisor = value as u16;
+            }
+            UART_FBRD => {
+                self.fractional_baud_rate_divisor = value as u16;
+            }
+            UART_LCR_H => {
+                self.line_control = value as u16;
+            }
+            UART_IFLS => {
+                self.interrupt_fifo_level_select = value as u16;
+            }
+            UART_DMACR => {
+                self.dma_control = value as u16;
             }
             _ => { /* unimplemented */ }
         }
