@@ -63,7 +63,7 @@ cargo test
 
 ## 既知の制限事項
 
-- USB3ホストコントローラ(VL805)向けのxHCIドライバ(`src/drivers/xhci.rs`)は、レジスタ配置やリング/コンテキストの構成をRaspberry Pi 4のU-Boot自身のxHCIスタックに合わせて実装したものですが、実機での動作検証はまだ行っていません。
+- USB3ホストコントローラ(VL805)向けのxHCIドライバ(`src/drivers/xhci.rs`)は、レジスタ配置やリング/コンテキストの構成をRaspberry Pi 4のU-Boot自身のxHCIスタックに合わせて実装したものです。実機(Raspberry Pi 4, 8 GiBモデル)では、USBハブ配下を含むマスストレージデバイスの列挙と、それをバックエンドとするゲストLinuxのログインプロンプトまでの起動を確認済みです。
 - ゲスト向けストレージはVirtio-Blk/SDHCI/USB Mass Storageの検出に対応していますが、それ以外のブロックデバイスは未対応です。
 - 4 GiB以上に配置されたRAMバンク(8 GiBモデルの上位バンクなど)は、xHCI/PCIeが32 bitアドレスまでしかDMAできないため、現状では利用せず起動時にスキップします(ログに`Ignore RAM ... above 4 GiB`と出力されます)。
 
