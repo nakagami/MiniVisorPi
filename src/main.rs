@@ -106,6 +106,13 @@ static mut FAT32: MaybeUninit<fat32::Fat32> = MaybeUninit::uninit();
 static GLOBAL_ALLOCATOR: GlobalAllocator = GlobalAllocator {};
 static CONSOLE: Mutex<console::Console> = Mutex::new(console::Console::new());
 static IS_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether the machine's DTB advertises EL3 PSCI firmware (and `smc` is
+/// therefore safe to execute at EL2). False e.g. on the Raspberry Pi 4's
+/// stock firmware, where secondary CPUs are brought up via the ARM
+/// spin-table protocol instead and `smc` is UNDEFINED. Read by
+/// [`handle_guest_smc`] to decide between forwarding a guest PSCI call to
+/// real firmware and emulating it.
+static HAS_PSCI: AtomicBool = AtomicBool::new(false);
 static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
 
 /// A physical CPU parked (WFE-looping) at EL2 by
@@ -302,6 +309,7 @@ extern "C" fn entry_main(argc: usize, argv: *const *const u8, entry_stack_pointe
         .search_node_by_compatible(b"arm,psci-0.2", None)
         .or_else(|| dtb.search_node_by_compatible(b"arm,psci", None))
         .is_some();
+    HAS_PSCI.store(has_psci, Ordering::Relaxed);
     if has_psci {
         let (major_version, minor_version) =
             psci::check_psci_version().expect("PSCI is not supported");
@@ -1059,8 +1067,16 @@ extern "C" fn smp_park_main() -> ! {
 /// by [`park_secondary_cpus_for_smp`] -- true multi-vCPU SMP, as opposed to
 /// the `boot`/`spawn` debug console commands' separate-VM-per-pCPU model.
 /// Every other PSCI function (SYSTEM_OFF, SYSTEM_RESET, version queries,
-/// ...) is passed through to the real firmware unmodified, e.g. so a
-/// guest-issued shutdown/reboot still powers off/resets real hardware.
+/// ...) is passed through to the real firmware unmodified when the machine
+/// actually has EL3 PSCI firmware ([`HAS_PSCI`]), e.g. so a guest-issued
+/// shutdown/reboot still powers off/resets real hardware. On machines
+/// without EL3 firmware (e.g. the Raspberry Pi 4, where `smc` executed at
+/// EL2 is UNDEFINED and would fault the hypervisor itself), a minimal
+/// PSCI v0.2 implementation is emulated instead: PSCI_VERSION reports v0.2
+/// so the guest never attempts v1.0-only calls such as PSCI_FEATURES,
+/// SYSTEM_OFF/SYSTEM_RESET park the calling vCPU (there is no firmware to
+/// perform a real power-off/reset), and everything else returns
+/// NOT_SUPPORTED.
 pub fn handle_guest_smc(registers: &mut exception::Registers) {
     if registers.x0 == psci::PSCI_CPU_ON {
         registers.x0 =
@@ -1076,8 +1092,26 @@ pub fn handle_guest_smc(registers: &mut exception::Registers) {
          * PSCI spec (CPU_OFF only returns to the caller on failure, which
          * this hypervisor's virtualized version cannot produce). */
         handle_guest_cpu_off(registers);
-    } else {
+    } else if HAS_PSCI.load(Ordering::Relaxed) {
         registers.x0 = unsafe { asm::smc(registers.x0, registers.x1, registers.x2, registers.x3) };
+        unsafe { asm::advance_elr_el2() };
+    } else {
+        /* No EL3/PSCI firmware exists on this machine, so forwarding via
+         * `smc` is impossible (it is UNDEFINED at EL2 there). Emulate a
+         * minimal PSCI v0.2 instead -- see this function's doc comment. */
+        registers.x0 = match registers.x0 {
+            psci::PSCI_VERSION => 2, /* Report PSCI v0.2 */
+            psci::PSCI_SYSTEM_OFF | psci::PSCI_SYSTEM_RESET => {
+                println!(
+                    "Guest requested PSCI SYSTEM_OFF/SYSTEM_RESET, but this machine has no \
+                     EL3 firmware to perform it; parking the vCPU instead."
+                );
+                loop {
+                    asm::wfe();
+                }
+            }
+            _ => (-1i32) as u64, /* NOT_SUPPORTED */
+        };
         unsafe { asm::advance_elr_el2() };
     }
 }

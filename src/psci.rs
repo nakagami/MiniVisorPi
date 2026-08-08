@@ -6,8 +6,9 @@ use crate::asm::smc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-const PSCI_VERSION: u64 = 0x8400_0000;
-const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+pub(crate) const PSCI_VERSION: u64 = 0x8400_0000;
+pub(crate) const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+pub(crate) const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 /// PSCI CPU_ON function ID (SMC64 variant, per `arm,psci-0.2`/`arm,psci-1.0`).
 /// Also the function ID an AArch64 guest kernel issues to *this* hypervisor
 /// (trapped via HCR_EL2.TSC, see `main::handle_guest_smc`) to bring up an
