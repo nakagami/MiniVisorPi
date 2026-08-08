@@ -16,7 +16,7 @@ AArch64向けの小型Type1ハイパーバイザ
 
 以下のコマンドでビルド後、自動的にQEMU(`aarch64`, `virt`マシン)上でMiniVisorとゲストLinuxが起動します。
 ```
-cargo run
+cargo run-qemu
 ```
 
 ## テストの実行
@@ -38,9 +38,9 @@ cargo test
    ```
    ./tools-pi4/build_buildroot.sh
    ```
-3. MiniVisor本体(`mini.elf`)をビルドします。`cargo build-pi4`を実行すると、ビルド後に`bin-pi4/disk/mini.elf`へ自動でコピーされます。
+3. MiniVisor本体(`mini.elf`)をビルドします。以下のスクリプトを実行すると、実機向けリンカスクリプト(`scripts/pi4.ld`)でビルド後に`bin-pi4/disk/mini.elf`へ自動でコピーされます(以前の`cargo build-pi4`エイリアスは、cargoがrustflagsを置き換えずに結合する仕様のためqemu.ldとpi4.ldの両方がリンカへ渡され、壊れたELFが生成される問題があったため廃止されました)。
    ```
-   cargo build-pi4
+   ./tools-pi4/build_minivisor.sh
    ```
 4. Raspberry Pi公式のGPUファームウェア(`start4.elf`、`fixup4.dat`)、公式デバイスツリー(`bcm2711-rpi-4-b.dtb`)、Bluetooth無効化用のデバイスツリーオーバーレイ(`disable-bt.dtbo`)を取得し、`bin-pi4/disk/`・`bin-pi4/disk/overlays/`に配置します。本リポジトリではライセンスの都合上これらを配布していないため、[raspberrypi/firmware](https://github.com/raspberrypi/firmware/tree/master/boot)から取得してください。デバイスツリーは必ずこの公式版を使用してください。u-bootのソースツリーに同梱されている`bcm2711-rpi-4-b.dtb`には`disable-bt.dtbo`が要求する`bt`・`uart0_pins`・`bt_pins`の`__symbols__`ラベルが存在せず、overlayの適用に失敗します。`disable-bt.dtbo`自体は、RPi4のPL011 UART(uart0)を初期状態のBluetoothモジュール向け配線からGPIO14/15ピンヘッダへ付け替えるために必要です(MiniVisorのシリアルドライバはPL011のみに対応しているため、これがないとコンソール出力がBluetooth側の配線へ流れて見えなくなります)。
    ```
@@ -65,6 +65,7 @@ cargo test
 
 - USB3ホストコントローラ(VL805)向けのxHCIドライバ(`src/drivers/xhci.rs`)は、レジスタ配置やリング/コンテキストの構成をRaspberry Pi 4のU-Boot自身のxHCIスタックに合わせて実装したものですが、実機での動作検証はまだ行っていません。
 - ゲスト向けストレージはVirtio-Blk/SDHCI/USB Mass Storageの検出に対応していますが、それ以外のブロックデバイスは未対応です。
+- 4 GiB以上に配置されたRAMバンク(8 GiBモデルの上位バンクなど)は、xHCI/PCIeが32 bitアドレスまでしかDMAできないため、現状では利用せず起動時にスキップします(ログに`Ignore RAM ... above 4 GiB`と出力されます)。
 
 ## ライセンスについて
 本ソフトウェアはApache License, Version 2.0にてライセンスされています。

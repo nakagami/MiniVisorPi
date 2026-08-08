@@ -3,7 +3,7 @@
 . tools-pi4/environment
 
 if [ ! -f $DISK_IMG_DIR$BINARY_NAME ]; then
-    echo "$DISK_IMG_DIR$BINARY_NAME not found. Run 'cargo build-pi4' first." >&2
+    echo "$DISK_IMG_DIR$BINARY_NAME not found. Run './tools-pi4/build_minivisor.sh' first." >&2
     exit 1
 fi
 

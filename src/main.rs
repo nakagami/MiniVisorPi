@@ -412,17 +412,40 @@ pub fn panic(info: &core::panic::PanicInfo) -> ! {
 }
 
 pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stack_pointer: usize) {
-    let memory = dtb
-        .search_node(b"memory", None)
-        .expect("Expected memory node.");
-    let (start, size) = dtb
-        .read_reg_property(&memory, 0)
-        .expect("Expected reg entry");
-    println!("RAM is [{:#X} ~ {:#X}]", start, start + size);
     let mut memory_allocator = MEMORY_ALLOCATOR.lock();
-    memory_allocator
-        .free(start, size)
-        .expect("Failed to free the RAM");
+    /* Register every RAM bank described by the DTB: a memory node may carry
+     * multiple reg entries and several memory@... nodes may exist. The 8 GiB
+     * Pi4, for example, splits RAM into a bank below 0x3B400000, another at
+     * 0x40000000..0xFC000000, and the remainder above 4 GiB. Reading only
+     * reg[0] of the first node leaves the other banks unknown, and reserving
+     * anything in them (e.g. an ELF segment placed there by the bootloader)
+     * panics with "Failed to reserve memory for the segment".
+     * Banks at/above 4 GiB are skipped: the xHCI/PCIe hardware can only DMA
+     * to 32-bit addresses, so that memory is unusable by the drivers here. */
+    const DMA_ADDRESS_LIMIT: usize = 1 << 32;
+    let mut current = Some(
+        dtb.search_node(b"memory", None)
+            .expect("Expected memory node."),
+    );
+    while let Some(memory) = current {
+        let mut index = 0;
+        while let Some((start, size)) = dtb.read_reg_property(&memory, index) {
+            index += 1;
+            if size == 0 {
+                continue;
+            }
+            if start >= DMA_ADDRESS_LIMIT {
+                println!("Ignore RAM [{start:#X} ~ {:#X}]: above 4 GiB", start + size);
+                continue;
+            }
+            let size = size.min(DMA_ADDRESS_LIMIT - start);
+            println!("RAM is [{:#X} ~ {:#X}]", start, start + size);
+            memory_allocator
+                .free(start, size)
+                .expect("Failed to free the RAM");
+        }
+        current = dtb.search_node(b"memory", Some(&memory));
+    }
 
     /* Exclude the DTB */
     println!(
