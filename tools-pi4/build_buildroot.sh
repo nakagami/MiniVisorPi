@@ -4,11 +4,17 @@
 
 VERSION="2026.05.1"
 
-rm -rf $BUILDROOT_DIR
-mkdir -p $BUILDROOT_DIR
+# $BUILDROOT_DIR is kept between runs so built objects are reused
+# (incremental build). Set CLEAN=1 to force a full rebuild from scratch.
+if [ "$CLEAN" = "1" ]; then
+    rm -rf $BUILDROOT_DIR
+fi
+mkdir -p $BUILDROOT_DIR $BUILDROOT_DIR/dl
 
 pushd $BUILDROOT_DIR
-curl https://buildroot.org/downloads/buildroot-$VERSION.tar.xz | tar xvJf -
+if [ ! -d buildroot-$VERSION ]; then
+    curl https://buildroot.org/downloads/buildroot-$VERSION.tar.xz | tar xvJf -
+fi
 pushd buildroot-$VERSION
 
 export FORCE_UNSAFE_CONFIGURE=1 # For docker
@@ -16,6 +22,11 @@ if [ "`echo $PATH | grep ' '`" ]; then
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" # For WSL
 fi
 
+# Cache downloaded source tarballs so even a CLEAN=1 rebuild does not
+# re-download everything.
+export BR2_DL_DIR=$BUILDROOT_DIR/dl
+
+if [ ! -f .config ]; then
 # raspberrypi4_64_defconfig targets real Raspberry Pi 4 hardware, unlike
 # qemu_aarch64_virt_defconfig used for the QEMU environment in
 # tools/build_buildroot.sh.
@@ -43,6 +54,7 @@ make raspberrypi4_64_defconfig
 ./utils/config --enable BR2_PACKAGE_PYTHON_PIP
 ./utils/config --set-str BR2_TARGET_ROOTFS_EXT2_SIZE "256M"
 make olddefconfig
+fi
 
 make -j$(nproc) || exit $?
 
@@ -51,4 +63,3 @@ cp output/images/rootfs.ext2 $DISK_IMG_DIR/DISK0
 
 popd
 popd
-rm -rf $BUILDROOT_DIR
