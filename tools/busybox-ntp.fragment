@@ -1,0 +1,4 @@
+# Enable busybox's ntpd applet so the guest can set its clock via NTP
+# (used by the rootfs overlay's /etc/init.d/S45ntptime). Without an RTC
+# the guest boots at the epoch, which breaks TLS certificate validation.
+CONFIG_NTPD=y

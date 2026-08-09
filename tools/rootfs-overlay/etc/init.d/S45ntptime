@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# Set the system clock via NTP (busybox ntpd one-shot), then leave a
+# daemon running to keep it disciplined. Everything runs in the
+# background so boot never blocks on this: real Raspberry Pi 4 hardware
+# may have no Ethernet cable plugged in. The guest has no RTC and would
+# otherwise boot with the clock at the epoch, which breaks TLS
+# certificate validation (pip install fails with "certificate is not yet
+# valid").
+case "$1" in
+  start)
+    (
+        sleep 10  # let DHCP bring the network up first
+        ntpd -n -q -p pool.ntp.org
+        ntpd -p pool.ntp.org
+    ) &
+    ;;
+  stop)
+    killall ntpd 2>/dev/null
+    ;;
+esac
+exit 0

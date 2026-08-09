@@ -23,6 +23,13 @@ sed -i -e 's/BR2_PACKAGE_HOST_QEMU=y/BR2_PACKAGE_HOST_QEMU=n/' .config
 # is too small once Python is included, so enlarge the rootfs to 256M.
 ./utils/config --enable BR2_PACKAGE_PYTHON3
 ./utils/config --enable BR2_PACKAGE_PYTHON_PIP
+
+# NTP clock sync at boot (busybox ntpd via a config fragment + the
+# rootfs overlay's /etc/init.d/S45ntptime). The guest has no RTC and
+# would otherwise sit at the epoch, breaking TLS (pip install fails
+# with "certificate is not yet valid").
+./utils/config --set-str BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES "$BASE_DIR/tools/busybox-ntp.fragment"
+./utils/config --set-str BR2_ROOTFS_OVERLAY "$BASE_DIR/tools/rootfs-overlay"
 ./utils/config --set-str BR2_TARGET_ROOTFS_EXT2_SIZE "256M"
 make olddefconfig
 

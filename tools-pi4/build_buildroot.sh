@@ -28,12 +28,14 @@ make raspberrypi4_64_defconfig
 # find /dev/vda; without this it panics at root-mount time.
 ./utils/config --set-str BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES "$BASE_DIR/tools-pi4/linux-virtio.fragment"
 
-# Real Pi4 hardware may boot with no Ethernet cable plugged in. The default
-# S40network script runs `ifup -a` (and thus `udhcpc`) synchronously, which
-# retries DHCPDISCOVER forever and blocks the rest of boot (including the
-# login prompt) when there is no link. Override it to background `ifup -a`
-# so boot always proceeds regardless of cable/link state.
-./utils/config --set-str BR2_ROOTFS_OVERLAY "$BASE_DIR/tools-pi4/rootfs-overlay"
+# Rootfs overlays. tools/rootfs-overlay carries /etc/init.d/S45ntptime,
+# which sets the clock via NTP (busybox ntpd) in the background -- the
+# guest has no RTC and would otherwise sit at the epoch, breaking TLS
+# (pip install fails with "certificate is not yet valid"). Real Pi4
+# hardware may boot with no Ethernet cable plugged in, so the sync must
+# never block boot.
+./utils/config --set-str BR2_ROOTFS_OVERLAY "$BASE_DIR/tools-pi4/rootfs-overlay $BASE_DIR/tools/rootfs-overlay"
+./utils/config --set-str BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES "$BASE_DIR/tools/busybox-ntp.fragment"
 
 # Python 3 + pip for the guest rootfs. The default 64M ext2 image
 # is too small once Python is included, so enlarge the rootfs to 256M.
