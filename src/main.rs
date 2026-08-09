@@ -1345,7 +1345,17 @@ fn handle_uart_interrupt() {
     handle_input(&PL011_DEVICE);
 }
 
+/// Serializes an entire `handle_input` drain loop across pCPUs. Both the
+/// physical UART IRQ handler and `wfx_handler` polling can run this
+/// concurrently on different cores; the per-byte `getc` (PL011_DEVICE lock)
+/// and the guest injection (`vm::input_uart`, per-VM locks) are individually
+/// locked but NOT atomic as a pair, so two drainers can interleave as
+/// getc(A), getc(B), push(B), push(A) and deliver adjacent bytes to the
+/// guest out of order (observed as e.g. "echo" arriving as "ceho").
+static UART_INPUT_LOCK: Mutex<()> = Mutex::new(());
+
 fn handle_input(device: &Mutex<dyn SerialDevice>) {
+    let _serialization_guard = UART_INPUT_LOCK.lock();
     loop {
         let c = device.lock().getc();
         if c.is_err() {

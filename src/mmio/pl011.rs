@@ -30,6 +30,8 @@ const UART_PCELL_ID3: usize = 0xFFC;
 
 /// Bit indicating whether the RX FIFO is empty
 const UART_FR_RXFE: u16 = 1 << 4;
+/// Bit indicating whether the RX FIFO is full
+const UART_FR_RXFF: u16 = 1 << 6;
 /// Bit indicating whether the receive interrupt is enabled
 const UART_IMSC_RXIM: u16 = 1 << 4;
 /// Bit indicating whether a receive interrupt has occurred
@@ -37,12 +39,25 @@ const UART_RIS_RXRIS: u16 = 1 << 4;
 /// PL011's virtual interrupt number
 const PL011_INT_ID: u32 = 33;
 
+/// Depth of the emulated RX FIFO. A real PL011 has a 16-byte FIFO, but the
+/// old 4-byte buffer silently dropped bytes whenever the guest did not drain
+/// it quickly enough (e.g. pasted text or any fast input burst). Since this
+/// is an emulation with no real baud-rate limit, a much deeper FIFO is cheap
+/// and makes fast host-side input reliable.
+const RX_FIFO_SIZE: usize = 256;
+
 pub struct Pl011Mmio {
     flag: u16,
     interrupt_mask: u16,
     raw_interrupt_status: u16,
     control: u16,
-    read_buffer: [u8; 4],
+    /* RX FIFO as a ring buffer: `rx_fifo_head` indexes the oldest buffered
+     * byte and `rx_fifo_len` counts buffered bytes. An explicit length (rather
+     * than the old "0 means empty slot" scheme) also allows NUL bytes to be
+     * received like any other byte. */
+    rx_fifo: [u8; RX_FIFO_SIZE],
+    rx_fifo_head: usize,
+    rx_fifo_len: usize,
     /* The following registers have no effect on this emulation's actual
      * behavior (there is no real baud-rate generator, FIFO depth, or
      * DMA engine to configure, and this virtual UART never reports a
@@ -63,11 +78,16 @@ pub struct Pl011Mmio {
 impl Pl011Mmio {
     pub fn new() -> Self {
         Self {
-            flag: 0,
+            /* The RX FIFO starts empty, so RXFE must be set from the
+             * beginning (the old code left it clear until the first read,
+             * making the guest believe a byte was already waiting). */
+            flag: UART_FR_RXFE,
             interrupt_mask: 0,
             raw_interrupt_status: 0,
             control: 0,
-            read_buffer: [0; 4],
+            rx_fifo: [0; RX_FIFO_SIZE],
+            rx_fifo_head: 0,
+            rx_fifo_len: 0,
             irda_low_power_counter: 0,
             integer_baud_rate_divisor: 0,
             fractional_baud_rate_divisor: 0,
@@ -78,13 +98,18 @@ impl Pl011Mmio {
     }
 
     pub fn push(&mut self, data: u8, distributor: &mut GicDistributorMmio) {
-        for c in &mut self.read_buffer {
-            if *c == 0 {
-                *c = data;
-                break;
-            }
+        if self.rx_fifo_len == RX_FIFO_SIZE {
+            /* FIFO full: drop the incoming byte (same policy as before, but
+             * now only reachable after 256 unread bytes instead of 4). */
+            return;
         }
-        self.flag &= !(UART_FR_RXFE);
+        let tail = (self.rx_fifo_head + self.rx_fifo_len) % RX_FIFO_SIZE;
+        self.rx_fifo[tail] = data;
+        self.rx_fifo_len += 1;
+        self.flag &= !UART_FR_RXFE;
+        if self.rx_fifo_len == RX_FIFO_SIZE {
+            self.flag |= UART_FR_RXFF;
+        }
         if (self.interrupt_mask & UART_IMSC_RXIM) != 0 {
             self.raw_interrupt_status |= UART_RIS_RXRIS;
             distributor.trigger_interrupt(PL011_INT_ID, None);
@@ -97,21 +122,17 @@ impl MmioHandler for Pl011Mmio {
         let value: u64;
         match offset {
             UART_DR => {
-                value = self.read_buffer[0] as u64;
-                for i in 1..(self.read_buffer.len()) {
-                    self.read_buffer[i - 1] = self.read_buffer[i];
-                }
-                /* The last slot vacated by the shift must be cleared; otherwise,
-                 * once the 4-byte FIFO fills up completely, the final received
-                 * byte never becomes 0 and keeps reappearing at the front on
-                 * every subsequent read, causing that character to repeat
-                 * forever and RXRIS to never clear (self.read_buffer[0] stays
-                 * non-zero). */
-                let last = self.read_buffer.len() - 1;
-                self.read_buffer[last] = 0;
-                if self.read_buffer[0] == 0 {
-                    self.flag |= UART_FR_RXFE;
-                    self.raw_interrupt_status &= !(UART_RIS_RXRIS);
+                if self.rx_fifo_len == 0 {
+                    value = 0;
+                } else {
+                    value = self.rx_fifo[self.rx_fifo_head] as u64;
+                    self.rx_fifo_head = (self.rx_fifo_head + 1) % RX_FIFO_SIZE;
+                    self.rx_fifo_len -= 1;
+                    self.flag &= !UART_FR_RXFF;
+                    if self.rx_fifo_len == 0 {
+                        self.flag |= UART_FR_RXFE;
+                        self.raw_interrupt_status &= !(UART_RIS_RXRIS);
+                    }
                 }
             }
             UART_FR => {
