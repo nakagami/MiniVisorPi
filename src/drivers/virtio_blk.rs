@@ -108,7 +108,8 @@ impl VirtioBlk {
             VIRTIO_MMIO_QUEUE_NUM,
             NUMBER_OF_DESCRIPTORS as u32,
         );
-        let queue = crate::allocate_pages(NUMBER_OF_PAGES_QUEUE, VIRTIO_PAGE_SHIFT)
+        /* The device DMAs to/from this queue (see crate::allocate_dma_pages). */
+        let queue = crate::allocate_dma_pages(NUMBER_OF_PAGES_QUEUE, VIRTIO_PAGE_SHIFT)
             .expect("Failed to allocate virtio queue");
         unsafe {
             core::ptr::write_bytes(

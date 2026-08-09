@@ -193,7 +193,9 @@ impl Genet {
             return Err(());
         };
 
-        let rx_buffers = crate::allocate_pages(
+        /* GENET DMAs into these buffers; keep them below 4 GiB (see
+         * crate::allocate_dma_pages). */
+        let rx_buffers = crate::allocate_dma_pages(
             (NUMBER_OF_DESCRIPTORS * RX_BUFFER_LENGTH).div_ceil(crate::paging::PAGE_SIZE),
             crate::paging::PAGE_SHIFT,
         )

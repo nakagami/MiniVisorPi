@@ -47,7 +47,8 @@ impl VirtQueue {
             >> VIRTIO_PAGE_SHIFT)
             + 1)
             + ((size_of::<VirtQueueUsed>() >> VIRTIO_PAGE_SHIFT) + 1);
-        let queue = crate::allocate_pages(number_of_pages_queue, VIRTIO_PAGE_SHIFT)
+        /* The device DMAs to/from this queue (see crate::allocate_dma_pages). */
+        let queue = crate::allocate_dma_pages(number_of_pages_queue, VIRTIO_PAGE_SHIFT)
             .expect("Failed to allocate virtio-net queue");
         unsafe {
             core::ptr::write_bytes(queue as *mut u8, 0, number_of_pages_queue << VIRTIO_PAGE_SHIFT)
@@ -173,7 +174,8 @@ impl VirtioNet {
             ];
         }
 
-        let rx_buffers = crate::allocate_pages(
+        /* The device DMAs into these buffers (see crate::allocate_dma_pages). */
+        let rx_buffers = crate::allocate_dma_pages(
             (NUMBER_OF_DESCRIPTORS * VIRTIO_NET_RX_BUFFER_SIZE).div_ceil(VIRTIO_PAGE_SIZE),
             VIRTIO_PAGE_SHIFT,
         )

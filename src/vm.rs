@@ -418,6 +418,10 @@ pub fn create_vm(
     const GUEST_GIC_CPU_INTERFACE_ADDRESS: usize = 0x8010000;
 
     /* Set up the basic elements of the virtual machine */
+    /* Guest RAM is only ever accessed by the hypervisor with CPU
+     * loads/stores (the virtio-mmio emulation copies by CPU), never by a
+     * hardware DMA engine, so unlike driver buffers it may be allocated
+     * from RAM banks at/above 4 GiB (see `setup_memory`). */
     let ram_physical_address = crate::allocate_pages(ram_size >> PAGE_SHIFT, PAGE_SHIFT)
         .expect("Failed to allocate memory for VM.");
     let vm_id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);

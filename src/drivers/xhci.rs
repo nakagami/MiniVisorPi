@@ -2338,7 +2338,10 @@ impl Xhci {
 impl DmaRegion {
     fn new(size: usize, align_order: usize) -> Result<Self, ()> {
         let pages = size.div_ceil(4096).max(1);
-        let address = crate::allocate_pages(pages, align_order).map_err(|_| ())?;
+        /* The xHCI controller DMAs to/from this region; the BCM2711 PCIe
+         * inbound window only reaches RAM below 4 GiB (see
+         * crate::allocate_dma_pages). */
+        let address = crate::allocate_dma_pages(pages, align_order).map_err(|_| ())?;
         unsafe { write_bytes(address as *mut u8, 0, pages * 4096) };
         let region = Self {
             address,

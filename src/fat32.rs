@@ -4,7 +4,7 @@
 
 use crate::drivers::block_device::BlockDevice;
 use crate::paging::PAGE_SHIFT;
-use crate::{allocate_pages, free_pages};
+use crate::{allocate_dma_pages, free_pages};
 
 const FAT32_SIGNATURE: [u8; 8] = [b'F', b'A', b'T', b'3', b'2', b' ', b' ', b' '];
 
@@ -122,7 +122,8 @@ impl Fat32 {
         /* Read the FAT */
         let fat_size = (fat_sectors as usize) * (bytes_per_sector as usize);
         let lba_aligned_fat_size = ((fat_size - 1) & (!(lba_size - 1))) + lba_size;
-        let fat = allocate_pages(
+        /* DMA-reachable: blk.read() below may go through SDHCI/xHCI */
+        let fat = allocate_dma_pages(
             (lba_aligned_fat_size >> PAGE_SHIFT) + 1,
             lba_size.ilog2() as usize,
         )
@@ -140,8 +141,9 @@ impl Fat32 {
         /* Read the root directory list */
         let root_directory_pages =
             (((sectors_per_cluster as usize) * (bytes_per_sector as usize)) >> PAGE_SHIFT) + 1;
-        let root_directory_list = allocate_pages(root_directory_pages, lba_size.ilog2() as usize)
-            .expect("Failed to allocate memory");
+        let root_directory_list =
+            allocate_dma_pages(root_directory_pages, lba_size.ilog2() as usize)
+                .expect("Failed to allocate memory");
 
         let fat32 = Fat32 {
             base_lba,
@@ -426,7 +428,8 @@ impl Fat32 {
                 & (!(self.lba_size - 1)))
                 + self.lba_size;
             let buffer = if data_offset != 0 {
-                allocate_pages((aligned_buffer_size >> PAGE_SHIFT) + 1, 0).or(Err(()))?
+                /* DMA-reachable: passed to blk.read() */
+                allocate_dma_pages((aligned_buffer_size >> PAGE_SHIFT) + 1, 0).or(Err(()))?
             } else {
                 buffer_address + buffer_pointer
             };

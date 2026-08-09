@@ -116,8 +116,8 @@ static IS_CONSOLE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static HAS_PSCI: AtomicBool = AtomicBool::new(false);
 static mut DTB: MaybeUninit<dtb::Dtb> = MaybeUninit::uninit();
 /// Total RAM (in bytes) registered with [`MEMORY_ALLOCATOR`] from the
-/// DTB's memory nodes, i.e. what the hypervisor can actually hand out
-/// (banks at/above 4 GiB are excluded; see [`setup_memory`]).
+/// DTB's memory nodes, including banks at/above 4 GiB (which only
+/// non-DMA consumers such as guest RAM may use; see [`setup_memory`]).
 static TOTAL_USABLE_RAM: AtomicUsize = AtomicUsize::new(0);
 /// RAM size given to each guest VM, computed once by [`setup_memory`]
 /// from [`TOTAL_USABLE_RAM`] and the number of physical CPUs.
@@ -437,9 +437,15 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
      * reg[0] of the first node leaves the other banks unknown, and reserving
      * anything in them (e.g. an ELF segment placed there by the bootloader)
      * panics with "Failed to reserve memory for the segment".
-     * Banks at/above 4 GiB are skipped: the xHCI/PCIe hardware can only DMA
-     * to 32-bit addresses, so that memory is unusable by the drivers here. */
-    const DMA_ADDRESS_LIMIT: usize = 1 << 32;
+     *
+     * Banks at/above 4 GiB are registered too. Hardware DMA cannot reach
+     * them -- the BCM2711 PCIe inbound window (RC_BAR2, see
+     * drivers/pcie_brcm.rs) only maps RAM below 4 GiB for the VL805 xHCI,
+     * and SDHCI/GENET share that limitation -- so buffers handed to those
+     * devices must come from [`allocate_dma_pages`]. Everything the
+     * hardware never DMAs to may live up there; in particular guest RAM,
+     * which the hypervisor only ever accesses with CPU loads/stores (the
+     * virtio-mmio emulation copies by CPU). */
     let mut total_ram = 0;
     let mut current = Some(
         dtb.search_node(b"memory", None)
@@ -452,11 +458,6 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
             if size == 0 {
                 continue;
             }
-            if start >= DMA_ADDRESS_LIMIT {
-                println!("Ignore RAM [{start:#X} ~ {:#X}]: above 4 GiB", start + size);
-                continue;
-            }
-            let size = size.min(DMA_ADDRESS_LIMIT - start);
             println!("RAM is [{:#X} ~ {:#X}]", start, start + size);
             memory_allocator
                 .free(start, size)
@@ -467,58 +468,41 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
     }
     TOTAL_USABLE_RAM.store(total_ram, Ordering::Relaxed);
 
-    /* Reserve a region of RAM, clamped to the below-4 GiB banks actually
-     * registered above. u-boot places its stack (and potentially the DTB)
-     * at the very top of RAM, which crosses the 4 GiB boundary when QEMU
-     * is given -m 4G (RAM starts at 0x40000000). Memory at/above 4 GiB
-     * was never registered with the allocator (the drivers cannot DMA to
-     * it), so nothing can ever be allocated from it -- reserving it is
-     * unnecessary, and failing to do so must not panic. */
-    fn reserve_registered_ram(
-        memory_allocator: &mut memory_allocator::MemoryAllocator,
-        start: usize,
-        size: usize,
-        what: &str,
-    ) {
-        const DMA_ADDRESS_LIMIT: usize = 1 << 32;
-        let end = start.saturating_add(size).min(DMA_ADDRESS_LIMIT);
-        if start >= end {
-            println!(
-                "{what} is [{start:#X} ~ {:#X}]: entirely above 4 GiB, nothing to reserve",
-                start + size
-            );
-            return;
-        }
-        println!("Reserve [{start:#X} ~ {end:#X}] for {what}");
-        memory_allocator
-            .reserve_memory(start, end - start, 0)
-            .expect("Failed to reserve memory");
-    }
-
     /* Exclude the DTB */
     println!(
         "DTB is [{:#X} ~ {:#X}]",
         dtb_address,
         dtb_address + dtb.get_total_size()
     );
-    reserve_registered_ram(&mut memory_allocator, dtb_address, dtb.get_total_size(), "DTB");
+    memory_allocator
+        .reserve_memory(dtb_address, dtb.get_total_size(), 0)
+        .expect("Failed to reserve DTB");
 
     let elf_header = elf::Elf64Header::new(elf_address).expect("Invalid ELF Header");
     for p in elf_header.get_program_headers() {
         if p.get_segment_type() == elf::ELF_PROGRAM_HEADER_SEGMENT_LOAD {
-            reserve_registered_ram(
-                &mut memory_allocator,
-                p.get_physical_address() as usize,
-                p.get_memory_size() as usize,
-                "the segment",
+            println!(
+                "Reserve [{:#X} ~ {:#X}]",
+                p.get_physical_address(),
+                p.get_physical_address() + p.get_memory_size()
             );
+            memory_allocator
+                .reserve_memory(
+                    p.get_physical_address() as usize,
+                    p.get_memory_size() as usize,
+                    0,
+                )
+                .expect("Failed to reserve memory for the segment");
         }
     }
 
     /* Exclude the stack */
     let stack_end = ((stack_pointer - 1) & !(paging::PAGE_SIZE - 1)) + paging::PAGE_SIZE;
     let stack_start = stack_end - STACK_SIZE;
-    reserve_registered_ram(&mut memory_allocator, stack_start, STACK_SIZE, "Stack");
+    println!("Reserve [{:#X} ~ {:#X}] for Stack", stack_start, stack_end);
+    memory_allocator
+        .reserve_memory(stack_start, STACK_SIZE, 0)
+        .expect("Failed to reserve memory for the stack");
 }
 
 /// Computes the per-guest RAM size and stores it in [`GUEST_RAM_SIZE`].
@@ -529,12 +513,13 @@ pub fn setup_memory(dtb: &dtb::Dtb, dtb_address: usize, elf_address: usize, stac
 /// VM n always uses DISKn (see `vm::create_vm`), so the index of the
 /// first missing file equals the number of guests the disk image was
 /// built for. Each guest gets (total - HYPERVISOR_RESERVE_SIZE) /
-/// #guests, clamped to [MIN_GUEST_RAM_SIZE, MAX_GUEST_RAM_SIZE] and
-/// aligned down to 2 MiB so it can be backed by Stage 2 block mappings.
+/// #guests, floored at MIN_GUEST_RAM_SIZE and aligned down to 2 MiB so
+/// it can be backed by Stage 2 block mappings. No upper cap is imposed:
+/// guest RAM may come from RAM banks above 4 GiB (see `setup_memory`),
+/// so on large-memory hosts a single guest gets nearly everything.
 pub fn init_guest_ram_size(fat32: &fat32::Fat32) {
     const HYPERVISOR_RESERVE_SIZE: usize = 0x1000_0000; /* 256 MiB */
     const MIN_GUEST_RAM_SIZE: usize = 0x800_0000; /* 128 MiB */
-    const MAX_GUEST_RAM_SIZE: usize = 0xC000_0000; /* 3 GiB */
     const GUEST_RAM_ALIGN: usize = 0x20_0000; /* 2 MiB */
     let mut number_of_guests = 0usize;
     while number_of_guests < 10 {
@@ -552,7 +537,7 @@ pub fn init_guest_ram_size(fat32: &fat32::Fat32) {
     let guest_ram_size = ((total_ram.saturating_sub(HYPERVISOR_RESERVE_SIZE) / number_of_guests)
         / GUEST_RAM_ALIGN
         * GUEST_RAM_ALIGN)
-        .clamp(MIN_GUEST_RAM_SIZE, MAX_GUEST_RAM_SIZE);
+        .max(MIN_GUEST_RAM_SIZE);
     GUEST_RAM_SIZE.store(guest_ram_size, Ordering::Relaxed);
     println!(
         "Usable RAM: {total_ram:#X}, {number_of_guests} guest disk(s) found, guest RAM size: {guest_ram_size:#X}"
@@ -581,6 +566,34 @@ pub fn allocate_pages(
         Ok(a) => Ok(a),
         Err(e) => {
             println!("Failed to allocate memory: {:?}", e);
+            Err(e)
+        }
+    }
+}
+
+/// Exclusive upper bound of the address range hardware DMA can reach:
+/// the BCM2711 PCIe inbound window (RC_BAR2, see drivers/pcie_brcm.rs)
+/// only maps RAM below 4 GiB for the VL805 xHCI, and SDHCI/GENET share
+/// the limitation. Buffers handed to those devices must come from
+/// [`allocate_dma_pages`]. Note the hypervisor's virtio-mmio device
+/// emulation copies guest RAM by CPU, so guest RAM itself is *not*
+/// subject to this limit and may be allocated above 4 GiB.
+pub const DMA_ADDRESS_LIMIT: usize = 1 << 32;
+
+/// Like [`allocate_pages`], but the returned pages are guaranteed to lie
+/// below [`DMA_ADDRESS_LIMIT`] so hardware DMA engines can reach them.
+pub fn allocate_dma_pages(
+    number_of_pages: usize,
+    align: usize,
+) -> Result<usize, memory_allocator::MemoryError> {
+    match MEMORY_ALLOCATOR.lock().allocate_below(
+        number_of_pages << paging::PAGE_SHIFT,
+        align,
+        DMA_ADDRESS_LIMIT,
+    ) {
+        Ok(a) => Ok(a),
+        Err(e) => {
+            println!("Failed to allocate DMA-reachable memory: {:?}", e);
             Err(e)
         }
     }

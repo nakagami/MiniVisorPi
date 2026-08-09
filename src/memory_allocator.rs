@@ -406,6 +406,31 @@ impl MemoryAllocator {
     }
 
     pub fn allocate(&mut self, size: usize, align_order: usize) -> Result<usize, MemoryError> {
+        self.allocate_with_address_limit(size, align_order, usize::MAX)
+    }
+
+    /// Like [`allocate`](Self::allocate), but the returned region is
+    /// guaranteed to lie entirely below `address_limit` (an exclusive
+    /// upper bound). Used for buffers handed to DMA engines with a
+    /// limited address reach: the BCM2711 PCIe inbound window (RC_BAR2,
+    /// see `drivers/pcie_brcm.rs`) only maps RAM below 4 GiB for the
+    /// VL805 xHCI, and SDHCI/GENET share the limitation -- even on boards
+    /// (e.g. the 8 GiB Pi4) where more RAM exists above that boundary.
+    pub fn allocate_below(
+        &mut self,
+        size: usize,
+        align_order: usize,
+        address_limit: usize,
+    ) -> Result<usize, MemoryError> {
+        self.allocate_with_address_limit(size, align_order, address_limit)
+    }
+
+    fn allocate_with_address_limit(
+        &mut self,
+        size: usize,
+        align_order: usize,
+        address_limit: usize,
+    ) -> Result<usize, MemoryError> {
         if size == 0 {
             return Err(MemoryError::InvalidRequest);
         } else if self.free_size < size {
@@ -421,12 +446,20 @@ impl MemoryAllocator {
 
             let mut entry = Some(first_entry);
             while let Some(e) = entry {
-                if e.get_size() >= size {
+                /* Entries use an *inclusive* end address; clamp it to the
+                 * limit to get the portion of this entry the allocation
+                 * is allowed to use. */
+                let start = e.get_start_address();
+                let end = e
+                    .get_end_address()
+                    .min(address_limit.saturating_sub(1));
+                let available_size = if end >= start { end - start + 1 } else { 0 };
+                if available_size >= size {
                     let address_to_allocate = if align_order != 0 {
                         let (aligned_address, aligned_available_size) =
                             Self::align_address_and_available_size(
-                                e.get_start_address(),
-                                e.get_size(),
+                                start,
+                                available_size,
                                 align_order,
                             );
                         if aligned_available_size < size {
