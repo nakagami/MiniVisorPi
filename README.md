@@ -36,7 +36,7 @@ cargo test
    ```
 2. Linuxカーネルとrootfs(`raspberrypi4_64_defconfig`)をビルドします。
    ```
-   ./tools-pi4/build_buildroot.sh
+   CLEAN=1 ./tools-pi4/build_buildroot.sh
    ```
 3. MiniVisor本体(`mini.elf`)をビルドします。以下のスクリプトを実行すると、実機向けリンカスクリプト(`scripts/pi4.ld`)でビルド後に`bin-pi4/disk/mini.elf`へ自動でコピーされます(以前の`cargo build-pi4`エイリアスは、cargoがrustflagsを置き換えずに結合する仕様のためqemu.ldとpi4.ldの両方がリンカへ渡され、壊れたELFが生成される問題があったため廃止されました)。
    ```
