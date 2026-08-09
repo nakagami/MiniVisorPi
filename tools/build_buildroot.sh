@@ -18,6 +18,15 @@ fi
 
 make qemu_aarch64_virt_defconfig
 sed -i -e 's/BR2_PACKAGE_HOST_QEMU=y/BR2_PACKAGE_HOST_QEMU=n/' .config
+
+# Python 3 + pip and git for the guest rootfs. The default 64M ext2 image
+# is too small once Python is included, so enlarge the rootfs to 256M.
+./utils/config --enable BR2_PACKAGE_PYTHON3
+./utils/config --enable BR2_PACKAGE_PYTHON_PIP
+./utils/config --enable BR2_PACKAGE_GIT
+./utils/config --set-str BR2_TARGET_ROOTFS_EXT2_SIZE "256M"
+make olddefconfig
+
 make -j$(nproc) || exit $?
 
 cp output/images/Image $DISK_IMG_DIR/Image
