@@ -3,11 +3,13 @@
 //!
 
 use crate::drivers::gicv2;
+use crate::drivers::generic_timer::GENERIC_TIMER_VIRTUAL_INT_ID;
 use crate::vgic;
 use crate::vm;
 use crate::vm::MmioHandler;
 
 use alloc::collections::linked_list::LinkedList;
+use alloc::vec::Vec;
 
 /* GIC Distributor (Virtual) */
 /*
@@ -262,6 +264,58 @@ impl GicDistributorMmio {
         (*self.priority_register(cpu, register) >> offset) & 0xFF
     }
 
+    /// Re-injects interrupts that are pending and enabled in this pCPU's
+    /// view of the virtual Distributor but could not be placed in a List
+    /// Register earlier (LR overflow). Called from
+    /// `vgic::maintenance_interrupt_handler` after guest EOIs free LRs --
+    /// the only recovery path for edge-triggered virtual interrupts
+    /// (virtio-net/blk/console), which never re-assert once their
+    /// notification was lost.
+    ///
+    /// Banked INTIDs (0-31) are retried on the pCPU owning that bank;
+    /// SPIs only on `own_target`'s pCPU, matching `trigger_interrupt`'s
+    /// fixed routing. The virtual Generic Timer PPI is excluded: its
+    /// retries are driven by the level-triggered physical PPI
+    /// re-asserting (see `irq_handler`), and re-injecting it here without
+    /// the LR HW bit would break the guest-initiated physical
+    /// deactivation that bit provides.
+    ///
+    /// INTIDs already held in some LR are merged into that same entry by
+    /// `vgic::add_virtual_interrupt` without consuming another LR, so
+    /// re-attempting them here is harmless.
+    pub fn inject_pending_for_current_cpu(&mut self) {
+        if (self.ctlr & (GICD_CTLR_ENABLE_GRP0 | GICD_CTLR_ENABLE_GRP1)) == 0 {
+            return;
+        }
+        let cpu = current_cpu_index();
+        let is_own_target = gicv2::get_current_cpu_target() == self.own_target;
+        let max_int_id = if is_own_target {
+            1024
+        } else {
+            BANKED_INT_ID_COUNT
+        } as u32;
+        let mut candidates: Vec<(u8, u32)> = Vec::new();
+        for int_id in 0..max_int_id {
+            if int_id == GENERIC_TIMER_VIRTUAL_INT_ID {
+                continue;
+            }
+            if self.get_pending(cpu, int_id) && self.get_enable(cpu, int_id) {
+                candidates.push((self.get_priority(cpu, int_id) as u8, int_id));
+            }
+        }
+        /* A lower GIC priority value means a higher priority: deliver
+         * those first when only some candidates fit in the free LRs. */
+        candidates.sort_unstable();
+        for (_, int_id) in candidates {
+            let group = self.get_group(cpu, int_id);
+            let priority = self.get_priority(cpu, int_id);
+            let entry = vgic::create_list_register_entry(int_id, group, priority, None);
+            if !vgic::add_virtual_interrupt(entry) {
+                break; /* LRs full again; retried on the next maintenance interrupt */
+            }
+        }
+    }
+
     /// Re-delivers an already-pending INTID after the guest enabled/re-pended it via MMIO.
     /// A banked INTID (SGI/PPI, 0-31) belongs to the pCPU that performed the write, while an
     /// SPI belongs to `own_target`.
@@ -352,7 +406,15 @@ pub fn inject_interrupt_handler() {
     let mut remaining = LinkedList::new();
     while let Some((target, entry)) = distributor.to_inject_interrupt.pop_front() {
         if target == current_target {
-            let _ = vgic::add_virtual_interrupt(entry);
+            /* Injection can fail when every List Register on this pCPU is
+             * occupied. Keep the entry queued instead of silently
+             * dropping the interrupt -- a lost guest IPI deadlocks the
+             * guest's SMP kernel. `vgic::maintenance_interrupt_handler`
+             * re-invokes this handler each time a guest EOI frees an LR,
+             * so the entry is retried there. */
+            if !vgic::add_virtual_interrupt(entry) {
+                remaining.push_back((target, entry));
+            }
         } else {
             remaining.push_back((target, entry));
         }

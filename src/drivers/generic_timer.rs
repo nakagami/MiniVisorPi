@@ -8,7 +8,11 @@ use crate::dtb;
 use crate::vm;
 
 pub static mut GENERIC_TIMER_PHYSICAL_INT_ID: u32 = 0;
-const GENERIC_TIMER_VIRTUAL_INT_ID: u32 = 27;
+/// INTID of the virtual timer PPI shown to the guest. `pub` so the vGIC
+/// Distributor emulation can exclude it from its LR-overflow retry scan
+/// (its retries are driven by the physical PPI re-asserting instead, to
+/// preserve the LR HW bit's guest-initiated physical deactivation).
+pub const GENERIC_TIMER_VIRTUAL_INT_ID: u32 = 27;
 
 pub fn init_generic_timer_global(dtb: &dtb::Dtb) {
     let generic_timer_node = dtb

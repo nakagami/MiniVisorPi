@@ -151,6 +151,10 @@ impl Console {
             "wfi polls: {}",
             crate::exception::WFI_POLL_COUNT.load(Ordering::Relaxed)
         );
+        println!(
+            "gich_lr overflows (retried): {}",
+            crate::vgic::LR_OVERFLOW_COUNT.load(Ordering::Relaxed)
+        );
         true
     }
 

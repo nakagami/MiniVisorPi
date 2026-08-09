@@ -8,6 +8,8 @@ use crate::mmio::gicv2::INJECT_INTERRUPT_INT_ID;
 use crate::vgic_lr;
 use crate::vm;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 pub const MAINTENANCE_INTERRUPT_INTID: u32 = 25;
 
 /* Fields (32-bit) of the GICv2 GICH_LR (List Register) that this module still
@@ -22,6 +24,16 @@ const GICH_LR_STATE_PENDING: u32 = 0b01 << GICH_LR_STATE_OFFSET;
 
 /// Maximum number of List Registers used by this hypervisor.
 pub const NUMBER_OF_SUPPORTED_LRS: usize = 4;
+
+/// Diagnostic (see the `stat` console command): how many times
+/// `add_virtual_interrupt` found every List Register occupied. Failed
+/// injections are retried later (see [`maintenance_interrupt_handler`]),
+/// so this is not by itself an error -- but a rapidly increasing count
+/// under load means the guest consumes virtual interrupts more slowly
+/// than they arrive. (This used to be a `println!` per failure, which
+/// under a real overflow flood saturated the physical UART and amplified
+/// the very interrupt latency that caused the overflow.)
+pub static LR_OVERFLOW_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Re-exported so existing callers (e.g. `mmio::gicv2`) can keep referring to
 /// `vgic::create_list_register_entry` unchanged; the implementation itself
@@ -81,7 +93,7 @@ pub fn add_virtual_interrupt(entry: u32) -> bool {
         }
     }
 
-    println!("GICH_LR is overflowed.");
+    LR_OVERFLOW_COUNT.fetch_add(1, Ordering::Relaxed);
     false
 }
 
@@ -102,4 +114,28 @@ pub fn maintenance_interrupt_handler() {
         }
         eoi_bits >>= 1;
     }
+
+    /* Every EOI processed above freed a List Register, so now retry the
+     * injections that previously failed because all LRs were occupied
+     * (LR overflow). This is the *only* recovery path for two classes of
+     * otherwise-lost interrupts:
+     *
+     * 1. Cross-pCPU injections queued in `to_inject_interrupt` (guest
+     *    IPIs/SGIs and SPIs targeting another pCPU): dropping one of
+     *    these deadlocks the guest's SMP kernel (observed as a
+     *    boot-time wedge under an LR-overflow flood).
+     * 2. Same-pCPU injections whose INTID stayed pending in the virtual
+     *    Distributor: edge-triggered virtual interrupts (virtio-net/blk/
+     *    console) never re-assert once their notification was lost, so
+     *    the guest would wait for them forever.
+     *
+     * The virtual Generic Timer PPI is deliberately *not* covered by
+     * (2): its retries are driven by the level-triggered physical PPI
+     * re-asserting (see `irq_handler`), which also keeps the LR HW bit
+     * intact for guest-initiated physical deactivation. */
+    crate::mmio::gicv2::inject_interrupt_handler();
+    vm::get_current_vm()
+        .get_gic_distributor_mmio()
+        .lock()
+        .inject_pending_for_current_cpu();
 }
