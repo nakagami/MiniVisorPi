@@ -46,6 +46,13 @@
 		compatible = "virtio,mmio";
 	};
 
+	virtio_mmio@a000400 {
+		dma-coherent;
+		interrupts = <0x00 0x12 0x01>;
+		reg = <0x00 0xa000400 0x00 0x200>;
+		compatible = "virtio,mmio";
+	};
+
 	timer {
 		interrupts = <0x01 0x0d 0xf04 0x01 0x0e 0xf04 0x01 0x0b 0xf04 0x01 0x0a 0xf04>;
 		always-on;
@@ -101,7 +108,11 @@
 		 * on *every* boot (observed: several minutes to reach a login
 		 * prompt with the 256MiB rootfs). Skipping the background zeroing
 		 * is safe -- ext4 zeroes inode tables on demand at allocation time. */
-		bootargs = "earlycon=pl011,0x9000000 console=ttyAMA0 root=/dev/vda rootflags=init_itable=0";
+		/* console=hvc0: the login console is the emulated virtio-console
+		 * (batched virtqueue I/O) instead of the emulated PL011, which costs
+		 * two EL2 MMIO traps per character under TCG. earlycon stays on the
+		 * PL011 so early kernel messages still appear before virtio probing. */
+		bootargs = "earlycon=pl011,0x9000000 console=hvc0 root=/dev/vda rootflags=init_itable=0";
 	};
 };
 

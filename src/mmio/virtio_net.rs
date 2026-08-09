@@ -30,9 +30,12 @@ const VIRTIO_NET_F_MAC: u32 = 1 << 5;
 const QUEUE_INDEX_RX: usize = 0;
 const QUEUE_INDEX_TX: usize = 1;
 
-struct QueueState {
-    queue_size: usize,
-    descriptor: *mut VirtQueueDesc,
+/// Per-VirtQueue bookkeeping for a legacy (virtio-mmio v1) queue: descriptor
+/// table/ring pointers, and the driver's and device's cursors into them.
+/// Shared with the virtio-console device (`super::virtio_console`).
+pub(crate) struct QueueState {
+    pub(crate) queue_size: usize,
+    pub(crate) descriptor: *mut VirtQueueDesc,
     avail_ring: *mut VirtQueueAvail,
     used_ring: *mut VirtQueueUsed,
     last_avail_id: u16,
@@ -40,7 +43,7 @@ struct QueueState {
 }
 
 impl QueueState {
-    const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             queue_size: 0,
             descriptor: null_mut(),
@@ -50,7 +53,7 @@ impl QueueState {
             used_id: 0,
         }
     }
-    fn get_descriptor(&self, id: u16) -> Option<VirtQueueDesc> {
+    pub(crate) fn get_descriptor(&self, id: u16) -> Option<VirtQueueDesc> {
         if !self.descriptor.is_null() {
             Some(unsafe {
                 read_volatile(
@@ -63,7 +66,7 @@ impl QueueState {
         }
     }
 
-    fn get_descriptor_id(&self, id: u16) -> Option<u16> {
+    pub(crate) fn get_descriptor_id(&self, id: u16) -> Option<u16> {
         if !self.avail_ring.is_null() {
             Some(unsafe {
                 read_volatile(
@@ -77,7 +80,7 @@ impl QueueState {
         }
     }
 
-    fn get_next_avail_id(&mut self) -> Option<u16> {
+    pub(crate) fn get_next_avail_id(&mut self) -> Option<u16> {
         if self.avail_ring.is_null() || self.queue_size == 0 {
             return None;
         }
@@ -89,7 +92,7 @@ impl QueueState {
         Some(next)
     }
 
-    fn write_used(&mut self, id: u16, length: u32) {
+    pub(crate) fn write_used(&mut self, id: u16, length: u32) {
         let used_id = self.used_id % (self.queue_size as u16);
         self.used_id += 1;
         unsafe {
@@ -107,7 +110,7 @@ impl QueueState {
         unsafe { &mut *self.used_ring }.idx = self.used_id;
     }
 
-    fn recompute_rings(&mut self, page_size: usize) {
+    pub(crate) fn recompute_rings(&mut self, page_size: usize) {
         self.avail_ring =
             ((self.descriptor as usize) + size_of::<VirtQueueDesc>() * self.queue_size) as *mut _;
         self.used_ring = ((((self.avail_ring as usize + size_of::<u16>() * (3 + self.queue_size))
@@ -116,7 +119,7 @@ impl QueueState {
             + page_size) as *mut _;
     }
 
-    fn reset(&mut self) {
+    pub(crate) fn reset(&mut self) {
         self.queue_size = 0;
         self.descriptor = null_mut();
         self.avail_ring = null_mut();

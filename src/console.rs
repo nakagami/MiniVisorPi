@@ -129,7 +129,7 @@ impl Console {
             "guest uart tx: chars={} total={}ms avg={}us",
             vwrites,
             vcycles / (freq / 1000),
-            if vwrites > 0 { vcycles / vwrites * 1000 / freq } else { 0 }
+            if vwrites > 0 { vcycles * 1_000_000 / vwrites / freq } else { 0 }
         );
         let pputc = crate::drivers::pl011::PHYS_PUTC_COUNT.load(Ordering::Relaxed);
         let pcycles = crate::drivers::pl011::PHYS_PUTC_CYCLES.load(Ordering::Relaxed);
@@ -137,7 +137,15 @@ impl Console {
             "physical uart putc: count={} total={}ms avg={}us",
             pputc,
             pcycles / (freq / 1000),
-            if pputc > 0 { pcycles / pputc * 1000 / freq } else { 0 }
+            if pputc > 0 { pcycles * 1_000_000 / pputc / freq } else { 0 }
+        );
+        let cbufs = crate::mmio::virtio_console::VCONSOLE_TX_BUFS.load(Ordering::Relaxed);
+        let cbytes = crate::mmio::virtio_console::VCONSOLE_TX_BYTES.load(Ordering::Relaxed);
+        println!(
+            "guest virtio-console tx: buffers={} bytes={:#x} avg_bytes_per_buf={}",
+            cbufs,
+            cbytes,
+            if cbufs > 0 { cbytes / cbufs } else { 0 }
         );
         println!(
             "wfi polls: {}",

@@ -33,6 +33,7 @@ mod mmio {
     pub mod gicv2;
     pub mod pl011;
     pub mod virtio_blk;
+    pub mod virtio_console;
     pub mod virtio_net;
 }
 mod paging;

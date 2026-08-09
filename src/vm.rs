@@ -13,7 +13,7 @@ use crate::fat32::Fat32;
 use crate::lock::Mutex;
 use crate::mmio::{
     gicv2::GicDistributorMmio, pl011::Pl011Mmio, virtio_blk::VirtioBlkMmio,
-    virtio_net::VirtioNetMmio,
+    virtio_console::VirtioConsoleMmio, virtio_net::VirtioNetMmio,
 };
 use crate::paging::*;
 use crate::registers::*;
@@ -211,6 +211,7 @@ pub struct VM {
     gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
     pl011_mmio: Arc<Mutex<Pl011Mmio>>,
     virtio_net_mmio: Arc<Mutex<VirtioNetMmio>>,
+    virtio_console_mmio: Arc<Mutex<VirtioConsoleMmio>>,
     context: Mutex<VcpuContext>,
 }
 
@@ -255,6 +256,7 @@ impl VM {
         gic_distributor_mmio: Arc<Mutex<GicDistributorMmio>>,
         pl011_mmio: Arc<Mutex<Pl011Mmio>>,
         virtio_net_mmio: Arc<Mutex<VirtioNetMmio>>,
+        virtio_console_mmio: Arc<Mutex<VirtioConsoleMmio>>,
     ) -> Self {
         Self {
             vm_id,
@@ -268,6 +270,7 @@ impl VM {
             gic_distributor_mmio,
             pl011_mmio,
             virtio_net_mmio,
+            virtio_console_mmio,
             context: Mutex::new(VcpuContext::new()),
         }
     }
@@ -373,6 +376,10 @@ impl VM {
 
     pub fn get_virtio_net_mmio(&self) -> &Mutex<VirtioNetMmio> {
         &self.virtio_net_mmio
+    }
+
+    pub fn get_virtio_console_mmio(&self) -> &Mutex<VirtioConsoleMmio> {
+        &self.virtio_console_mmio
     }
 }
 
@@ -532,6 +539,10 @@ pub fn create_vm(
     let virtio_net_mmio = Arc::new(Mutex::new(VirtioNetMmio::new(net_mac)));
     mmio_handlers.push_back(MmioEntry::new(0xa000200, 0x0200, virtio_net_mmio.clone()));
 
+    /* Virtio-Console (guest console=hvc0; the PL011 stays for earlycon) */
+    let virtio_console_mmio = Arc::new(Mutex::new(VirtioConsoleMmio::new()));
+    mmio_handlers.push_back(MmioEntry::new(0xa000400, 0x0200, virtio_console_mmio.clone()));
+
     /* Create the VM structure */
     let owner_affinity = asm::mpidr_to_affinity(cpu_mpidr);
     let vm = VM::new(
@@ -546,6 +557,7 @@ pub fn create_vm(
         gic_distributor_mmio,
         pl011_mmio,
         virtio_net_mmio,
+        virtio_console_mmio,
     );
 
     /* Load the Linux kernel and devicetree */
@@ -699,6 +711,9 @@ pub fn input_uart(c: u8) {
     vm.get_pl011_mmio()
         .lock()
         .push(c, &mut vm.get_gic_distributor_mmio().lock());
+    /* The guest's login console is hvc0 (virtio-console) once booted, with
+     * the PL011 serving only as earlycon, so feed input to both devices. */
+    vm.get_virtio_console_mmio().lock().push_rx(c, &vm);
 }
 
 /// Injects a received Ethernet frame into the current VM's Virtio-Net device.
