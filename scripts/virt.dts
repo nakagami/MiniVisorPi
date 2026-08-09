@@ -95,7 +95,13 @@
 
 	chosen {
 		stdout-path = "/pl011@9000000";
-		bootargs = "earlycon=pl011,0x9000000 console=ttyAMA0 root=/dev/vda";
+		/* rootflags=init_itable=0: every `cargo run-qemu` re-copies the
+		 * pristine buildroot rootfs into disk.img, so ext4's lazyinit would
+		 * otherwise re-zero all inode tables through the emulated virtio-blk
+		 * on *every* boot (observed: several minutes to reach a login
+		 * prompt with the 256MiB rootfs). Skipping the background zeroing
+		 * is safe -- ext4 zeroes inode tables on demand at allocation time. */
+		bootargs = "earlycon=pl011,0x9000000 console=ttyAMA0 root=/dev/vda rootflags=init_itable=0";
 	};
 };
 

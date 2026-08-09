@@ -11,6 +11,13 @@ use core::ptr::{null_mut, read_volatile, write_volatile};
 
 const VIRTIO_BLK_INT_ID: u32 = 40;
 
+/// Diagnostic counters for guest I/O performance analysis (see the `stat`
+/// console command). Cycle values are in CNTPCT_EL0 ticks.
+pub static VBLK_REQUESTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static VBLK_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static VBLK_CYCLES_TOTAL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static VBLK_CYCLES_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub struct VirtioBlkMmio {
     file: FileInfo,
     interrupt_status: u32,
@@ -108,6 +115,7 @@ impl VirtioBlkMmio {
 
     fn operation(&mut self) {
         while let Some(id) = self.get_next_avail_id() {
+            let stat_start = crate::asm::get_cntpct_el0();
             let Some(descriptor_id) = self.get_descriptor_id(id) else {
                 println!("Failed to get the next descriptor id");
                 return;
@@ -188,6 +196,14 @@ impl VirtioBlkMmio {
                 println!("Failed to write the status");
             }
             self.write_used(descriptor_id, total_size);
+            {
+                use core::sync::atomic::Ordering;
+                let elapsed = crate::asm::get_cntpct_el0() - stat_start;
+                VBLK_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                VBLK_BYTES.fetch_add(total_size as u64, Ordering::Relaxed);
+                VBLK_CYCLES_TOTAL.fetch_add(elapsed, Ordering::Relaxed);
+                VBLK_CYCLES_MAX.fetch_max(elapsed, Ordering::Relaxed);
+            }
         }
         self.interrupt_status |= 1;
         get_current_vm()

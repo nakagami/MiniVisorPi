@@ -12,6 +12,14 @@ pub const VIRTIO_BLK_S_IOERR: u8 = 1;
 /// Whether the disk is Read Only
 const VIRTIO_BLK_F_RO: u32 = 1 << 5;
 
+/// Diagnostic counters for physical (hypervisor->QEMU) I/O performance
+/// analysis (see the `stat` console command). Cycle values are in
+/// CNTPCT_EL0 ticks.
+pub static PHYS_IO_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static PHYS_IO_CYCLES_TOTAL: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static PHYS_IO_CYCLES_MAX: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[repr(C)]
 pub struct VirtioBlkReq {
     pub req_type: u32,
@@ -171,6 +179,7 @@ impl VirtioBlk {
         length: u64,
         is_write: bool,
     ) -> Result<(), ()> {
+        let stat_start = crate::asm::get_cntpct_el0();
         if (block_address & ((1 << 9) - 1)) != 0 || (length & ((1 << 9) - 1) != 0) {
             println!(
                 "Block Address({:#X}) and Length({:#X}) must be 512Byte-Aligned.",
@@ -249,6 +258,14 @@ impl VirtioBlk {
         self.free_descriptor(first_idx);
         self.free_descriptor(second_idx);
         self.free_descriptor(third_idx);
+
+        {
+            use core::sync::atomic::Ordering;
+            let elapsed = crate::asm::get_cntpct_el0() - stat_start;
+            PHYS_IO_COUNT.fetch_add(1, Ordering::Relaxed);
+            PHYS_IO_CYCLES_TOTAL.fetch_add(elapsed, Ordering::Relaxed);
+            PHYS_IO_CYCLES_MAX.fetch_max(elapsed, Ordering::Relaxed);
+        }
 
         result
     }

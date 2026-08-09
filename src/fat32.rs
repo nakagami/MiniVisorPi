@@ -31,9 +31,47 @@ pub struct Fat32 {
     root_directory_list: usize,
 }
 
+/// Diagnostic: total FAT chain entries walked (see the `stat` console
+/// command).
+pub static FAT_WALK_STEPS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 pub struct FileInfo {
     entry_cluster: u32,
     file_size: u32,
+    /// Cache of the last FAT chain position walked, packed as
+    /// `(cluster_index << 32) | cluster_number`. read()/write() used to walk
+    /// the chain from `entry_cluster` on EVERY request, making sequential
+    /// I/O on an N-cluster file cost O(N^2) FAT lookups (painful for the
+    /// 256MiB guest rootfs: ~64k entries walked per 4KiB request near the
+    /// end of the file). Starting the walk from this hint when it is not
+    /// ahead of the requested offset restores O(N) overall.
+    ///
+    /// Cell is sound here: FileInfo is only ever accessed through a
+    /// Mutex-protected MMIO device (e.g. VirtioBlkMmio).
+    walk_hint: core::cell::Cell<u64>,
+}
+
+impl FileInfo {
+    /// Returns the (start_cluster, number of clusters already walked from
+    /// entry_cluster) pair to begin a chain walk from, using walk_hint when
+    /// it is valid and not ahead of the requested position.
+    fn walk_start(&self, clusters_to_skip: usize) -> (u32, usize) {
+        let hint = self.walk_hint.get();
+        let hint_index = (hint >> 32) as usize;
+        let hint_cluster = hint as u32;
+        if hint_cluster >= 2 && hint_index <= clusters_to_skip {
+            (hint_cluster, hint_index)
+        } else {
+            (self.entry_cluster, 0)
+        }
+    }
+
+    /// Records that the cluster at `index` steps from entry_cluster is
+    /// `cluster`, so later requests at higher offsets can skip the walk.
+    fn update_walk_hint(&self, index: usize, cluster: u32) {
+        self.walk_hint.set(((index as u64) << 32) | cluster as u64);
+    }
 }
 
 #[repr(C)]
@@ -141,7 +179,14 @@ impl Fat32 {
             + (cluster - 2) * (self.sectors_per_cluster as u32)
     }
 
+    /// Diagnostic: total FAT chain entries walked (see the `stat` console
+    /// command).
+    pub fn bump_walk_steps() {
+        FAT_WALK_STEPS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
     fn get_next_cluster(&self, cluster: u32) -> Option<u32> {
+        Self::bump_walk_steps();
         let fat = unsafe {
             core::slice::from_raw_parts(
                 self.fat as *const u32,
@@ -295,6 +340,7 @@ impl Fat32 {
                     return Some(FileInfo {
                         entry_cluster,
                         file_size,
+                        walk_hint: core::cell::Cell::new(0),
                     });
                 }
             }
@@ -332,11 +378,12 @@ impl Fat32 {
         let bytes_per_cluster = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
         let clusters_to_skip = offset / bytes_per_cluster;
         let mut data_offset = offset - clusters_to_skip * bytes_per_cluster;
-        let mut reading_cluster = file_info.entry_cluster;
+        let (mut reading_cluster, walk_start_index) = file_info.walk_start(clusters_to_skip);
         let mut buffer_pointer = 0usize;
 
-        for _ in 0..clusters_to_skip {
+        for cluster_index in walk_start_index..clusters_to_skip {
             reading_cluster = next_cluster!(reading_cluster);
+            file_info.update_walk_hint(cluster_index + 1, reading_cluster);
         }
 
         loop {
@@ -442,11 +489,12 @@ impl Fat32 {
         let bytes_per_cluster = self.sectors_per_cluster as usize * self.bytes_per_sector as usize;
         let clusters_to_skip = offset / bytes_per_cluster;
         let mut data_offset = offset - clusters_to_skip * bytes_per_cluster;
-        let mut writing_cluster = file_info.entry_cluster;
+        let (mut writing_cluster, walk_start_index) = file_info.walk_start(clusters_to_skip);
         let mut buffer_pointer = 0usize;
 
-        for _ in 0..clusters_to_skip {
+        for cluster_index in walk_start_index..clusters_to_skip {
             writing_cluster = next_cluster!(writing_cluster);
+            file_info.update_walk_hint(cluster_index + 1, writing_cluster);
         }
 
         loop {

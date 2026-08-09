@@ -14,12 +14,13 @@ pub struct Console {
 impl Console {
     const BUFFER_SIZE: usize = 64;
     #[allow(clippy::type_complexity)]
-    const COMMAND_LIST: [(&str, fn(SplitWhitespace) -> bool); 5] = [
+    const COMMAND_LIST: [(&str, fn(SplitWhitespace) -> bool); 6] = [
         ("boot", Self::boot_vm),
         ("switch", Self::switch_vm),
         ("spawn", Self::spawn_vm),
         ("echo", Self::echo),
         ("poweroff", Self::power_off),
+        ("stat", Self::stat),
     ];
 
     pub const fn new() -> Self {
@@ -91,6 +92,38 @@ impl Console {
     pub fn power_off(_: SplitWhitespace) -> bool {
         println!("The host machine will shutdown!");
         crate::psci::system_off()
+    }
+
+    /// Dumps guest/physical I/O diagnostic counters (requests, bytes, FAT
+    /// chain walk steps, and CNTPCT cycle totals/maxima).
+    pub fn stat(_: SplitWhitespace) -> bool {
+        use core::sync::atomic::Ordering;
+        let freq = crate::asm::get_cntfrq_el0();
+        let reqs = crate::mmio::virtio_blk::VBLK_REQUESTS.load(Ordering::Relaxed);
+        let bytes = crate::mmio::virtio_blk::VBLK_BYTES.load(Ordering::Relaxed);
+        let total = crate::mmio::virtio_blk::VBLK_CYCLES_TOTAL.load(Ordering::Relaxed);
+        let max = crate::mmio::virtio_blk::VBLK_CYCLES_MAX.load(Ordering::Relaxed);
+        println!(
+            "guest virtio-blk: requests={} bytes={:#x} total={}ms max={}ms",
+            reqs,
+            bytes,
+            total / (freq / 1000),
+            max / (freq / 1000)
+        );
+        let pcount = crate::drivers::virtio_blk::PHYS_IO_COUNT.load(Ordering::Relaxed);
+        let ptotal = crate::drivers::virtio_blk::PHYS_IO_CYCLES_TOTAL.load(Ordering::Relaxed);
+        let pmax = crate::drivers::virtio_blk::PHYS_IO_CYCLES_MAX.load(Ordering::Relaxed);
+        println!(
+            "physical blk io: count={} total={}ms max={}ms",
+            pcount,
+            ptotal / (freq / 1000),
+            pmax / (freq / 1000)
+        );
+        println!(
+            "fat walk steps: {}",
+            crate::fat32::FAT_WALK_STEPS.load(Ordering::Relaxed)
+        );
+        true
     }
 
     pub fn boot_vm(_: SplitWhitespace) -> bool {
