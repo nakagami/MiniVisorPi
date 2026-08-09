@@ -35,11 +35,10 @@ make raspberrypi4_64_defconfig
 # so boot always proceeds regardless of cable/link state.
 ./utils/config --set-str BR2_ROOTFS_OVERLAY "$BASE_DIR/tools-pi4/rootfs-overlay"
 
-# Python 3 + pip and git for the guest rootfs. The default 64M ext2 image
+# Python 3 + pip for the guest rootfs. The default 64M ext2 image
 # is too small once Python is included, so enlarge the rootfs to 256M.
 ./utils/config --enable BR2_PACKAGE_PYTHON3
 ./utils/config --enable BR2_PACKAGE_PYTHON_PIP
-./utils/config --enable BR2_PACKAGE_GIT
 ./utils/config --set-str BR2_TARGET_ROOTFS_EXT2_SIZE "256M"
 make olddefconfig
 
