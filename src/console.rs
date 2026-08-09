@@ -123,6 +123,26 @@ impl Console {
             "fat walk steps: {}",
             crate::fat32::FAT_WALK_STEPS.load(Ordering::Relaxed)
         );
+        let vwrites = crate::mmio::pl011::VUART_DR_WRITES.load(Ordering::Relaxed);
+        let vcycles = crate::mmio::pl011::VUART_DR_WRITE_CYCLES.load(Ordering::Relaxed);
+        println!(
+            "guest uart tx: chars={} total={}ms avg={}us",
+            vwrites,
+            vcycles / (freq / 1000),
+            if vwrites > 0 { vcycles / vwrites * 1000 / freq } else { 0 }
+        );
+        let pputc = crate::drivers::pl011::PHYS_PUTC_COUNT.load(Ordering::Relaxed);
+        let pcycles = crate::drivers::pl011::PHYS_PUTC_CYCLES.load(Ordering::Relaxed);
+        println!(
+            "physical uart putc: count={} total={}ms avg={}us",
+            pputc,
+            pcycles / (freq / 1000),
+            if pputc > 0 { pcycles / pputc * 1000 / freq } else { 0 }
+        );
+        println!(
+            "wfi polls: {}",
+            crate::exception::WFI_POLL_COUNT.load(Ordering::Relaxed)
+        );
         true
     }
 

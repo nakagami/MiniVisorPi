@@ -123,13 +123,24 @@ impl Pl011 {
     }
 }
 
+/// Diagnostic counters for physical console output cost (see the `stat`
+/// console command). Cycle values are in CNTPCT_EL0 ticks.
+pub static PHYS_PUTC_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub static PHYS_PUTC_CYCLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Implementation required for use with the Serial struct
 impl serial::SerialDevice for Pl011 {
     fn putc(&self, c: u8) -> Result<(), Error> {
+        let stat_start = crate::asm::get_cntpct_el0();
         while self.is_tx_fifo_full() {
             core::hint::spin_loop();
         }
         unsafe { ptr::write_volatile((self.base_address + UART_DR) as *mut u8, c) };
+        use core::sync::atomic::Ordering;
+        PHYS_PUTC_COUNT.fetch_add(1, Ordering::Relaxed);
+        PHYS_PUTC_CYCLES.fetch_add(crate::asm::get_cntpct_el0() - stat_start, Ordering::Relaxed);
         Ok(())
     }
 

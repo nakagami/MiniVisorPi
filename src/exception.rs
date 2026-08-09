@@ -334,10 +334,40 @@ extern "C" fn synchronous_handler(registers: *mut Registers) {
 ///    (see `vm::try_yield_to_next_vcpu`) instead of always resuming the caller.
 /// Otherwise (or if there is nothing else to run), just advance past WFI so the
 /// guest re-evaluates its wait condition.
+/// Diagnostic: how often the WFI polling path has run (see the `stat`
+/// console command).
+pub static WFI_POLL_COUNT: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
+/// Per-pCPU CNTPCT_EL0 timestamp of the last WFI-triggered device poll.
+static LAST_WFI_POLL: [core::sync::atomic::AtomicU64; 8] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; 8];
+
 fn wfx_handler(registers: &mut Registers) {
-    crate::handle_uart_interrupt();
-    if crate::needs_net_polling_on_wfx() {
-        crate::handle_net_rx();
+    WFI_POLL_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    /* Rate-limit the UART/net polling (and guest-console flush) to once per
+     * ~1ms per pCPU. Idle vCPUs hit WFI in a tight loop, and polling on every
+     * trap made the global UART/serial locks (PL011_DEVICE, UART_INPUT_LOCK)
+     * a permanent convoy: measurements during boot showed ~1.2M polls with
+     * each polling pCPU queueing ahead of any vCPU trying to do real console
+     * I/O, inflating per-character output cost to ~3ms. On QEMU the physical
+     * UART IRQ delivers input independently of this poll, and on real Pi4
+     * hardware a 1ms worst-case input latency is unnoticeable on a console. */
+    let cpu = (crate::asm::get_mpidr_el1() & 0xFF) as usize;
+    if let Some(slot) = LAST_WFI_POLL.get(cpu) {
+        let now = crate::asm::get_cntpct_el0();
+        let last = slot.load(core::sync::atomic::Ordering::Relaxed);
+        if now.wrapping_sub(last) >= crate::asm::get_cntfrq_el0() / 1000 {
+            slot.store(now, core::sync::atomic::Ordering::Relaxed);
+            crate::handle_uart_interrupt();
+            if crate::needs_net_polling_on_wfx() {
+                crate::handle_net_rx();
+            }
+            /* Flush guest console output buffered by the emulated PL011 (see
+             * mmio::pl011): a guest waiting for input idles via WFI, so its
+             * prompt appears within ~1ms without an explicit newline. */
+            vm::get_current_vm().get_pl011_mmio().lock().flush_tx();
+        }
     }
     if !vm::try_yield_to_next_vcpu(registers) {
         unsafe { asm::advance_elr_el2() };

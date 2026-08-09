@@ -39,12 +39,27 @@ const UART_RIS_RXRIS: u16 = 1 << 4;
 /// PL011's virtual interrupt number
 const PL011_INT_ID: u32 = 33;
 
+/// Diagnostic counters for guest console output cost (see the `stat`
+/// console command). Cycle values are in CNTPCT_EL0 ticks.
+pub static VUART_DR_WRITES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub static VUART_DR_WRITE_CYCLES: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+
 /// Depth of the emulated RX FIFO. A real PL011 has a 16-byte FIFO, but the
 /// old 4-byte buffer silently dropped bytes whenever the guest did not drain
 /// it quickly enough (e.g. pasted text or any fast input burst). Since this
 /// is an emulation with no real baud-rate limit, a much deeper FIFO is cheap
 /// and makes fast host-side input reliable.
 const RX_FIFO_SIZE: usize = 256;
+
+/// Guest TX (console output) buffer size. The guest writes DR one character
+/// at a time, and every write used to go straight to print! -> the global
+/// serial lock -> a physical UART MMIO write, so a single line of console
+/// output cost dozens of lock acquisitions and QEMU MMIO callbacks. Buffer
+/// a whole line and flush it with one print! on '\n', when full, or when
+/// the guest idles (wfx_handler calls flush_tx), cutting that to one lock
+/// acquisition per line.
+const TX_BUFFER_SIZE: usize = 256;
 
 pub struct Pl011Mmio {
     flag: u16,
@@ -58,6 +73,8 @@ pub struct Pl011Mmio {
     rx_fifo: [u8; RX_FIFO_SIZE],
     rx_fifo_head: usize,
     rx_fifo_len: usize,
+    tx_buffer: [u8; TX_BUFFER_SIZE],
+    tx_len: usize,
     /* The following registers have no effect on this emulation's actual
      * behavior (there is no real baud-rate generator, FIFO depth, or
      * DMA engine to configure, and this virtual UART never reports a
@@ -88,6 +105,8 @@ impl Pl011Mmio {
             rx_fifo: [0; RX_FIFO_SIZE],
             rx_fifo_head: 0,
             rx_fifo_len: 0,
+            tx_buffer: [0; TX_BUFFER_SIZE],
+            tx_len: 0,
             irda_low_power_counter: 0,
             integer_baud_rate_divisor: 0,
             fractional_baud_rate_divisor: 0,
@@ -114,6 +133,28 @@ impl Pl011Mmio {
             self.raw_interrupt_status |= UART_RIS_RXRIS;
             distributor.trigger_interrupt(PL011_INT_ID, None);
         }
+    }
+
+    /// Writes buffered guest TX output to the physical console with a single
+    /// print! (one serial-lock acquisition per flush instead of per char).
+    /// Called on newline/buffer-full from the DR write handler, and from
+    /// wfx_handler when the guest idles, so partial lines (e.g. a shell
+    /// prompt) still appear within ~1ms.
+    pub fn flush_tx(&mut self) {
+        if self.tx_len == 0 {
+            return;
+        }
+        /* from_utf8_lossy needs alloc; console output is ASCII in practice,
+         * so fall back to per-byte printing only for non-UTF-8 runs. */
+        match core::str::from_utf8(&self.tx_buffer[..self.tx_len]) {
+            Ok(s) => print!("{s}"),
+            Err(_) => {
+                for &b in &self.tx_buffer[..self.tx_len] {
+                    print!("{}", b as char);
+                }
+            }
+        }
+        self.tx_len = 0;
     }
 }
 
@@ -212,7 +253,19 @@ impl MmioHandler for Pl011Mmio {
     fn write(&mut self, offset: usize, _access_width: u64, value: u64) -> Result<(), ()> {
         match offset {
             UART_DR => {
-                print!("{}", value as u8 as char);
+                let stat_start = crate::asm::get_cntpct_el0();
+                let c = value as u8;
+                if self.tx_len < TX_BUFFER_SIZE {
+                    self.tx_buffer[self.tx_len] = c;
+                    self.tx_len += 1;
+                }
+                if c == b'\n' || self.tx_len == TX_BUFFER_SIZE {
+                    self.flush_tx();
+                }
+                use core::sync::atomic::Ordering;
+                VUART_DR_WRITES.fetch_add(1, Ordering::Relaxed);
+                VUART_DR_WRITE_CYCLES
+                    .fetch_add(crate::asm::get_cntpct_el0() - stat_start, Ordering::Relaxed);
             }
             UART_CR => {
                 self.control = value as u16;
