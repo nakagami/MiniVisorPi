@@ -10,6 +10,10 @@
 		compatible = "arm,psci-1.0\0arm,psci-0.2\0arm,psci";
 	};
 
+	/* The size field (0x10000000) is only a placeholder: the hypervisor
+	 * computes the guest RAM size at boot from the host's usable RAM and
+	 * the number of physical CPUs, and rewrites this reg entry when
+	 * loading this DTB into guest RAM (see vm.rs `create_vm`). */
 	memory@40000000 {
 		reg = <0x00 0x40000000 0x00 0x10000000>;
 		device_type = "memory";

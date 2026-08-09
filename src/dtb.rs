@@ -531,6 +531,33 @@ impl Dtb {
         Some((address, size))
     }
 
+    /// Overwrites the size field of the `index`-th entry of `node`'s
+    /// `reg` property in place with `size` (big-endian, `size_cells`
+    /// 32-bit cells). Used to patch the guest DTB's memory node after it
+    /// has been loaded into guest RAM, so the guest sees the RAM size
+    /// actually allocated to it rather than the placeholder baked into
+    /// the DTB file on disk.
+    pub fn write_reg_size(&self, node: &DtbNode, index: usize, size: usize) -> Result<(), ()> {
+        let info = self.get_property(node, &Self::PROP_REG).ok_or(())?;
+        let offset = ((info.address_cells + info.size_cells) as usize) * 4 * index
+            + (info.address_cells as usize) * 4;
+        if offset + (info.size_cells as usize) * 4 > info.len as usize {
+            return Err(());
+        }
+        for i in 0..(info.size_cells as usize) {
+            let shift = (info.size_cells as usize - 1 - i) * 32;
+            let cell = if shift >= usize::BITS as usize {
+                0
+            } else {
+                (size >> shift) as u32
+            };
+            unsafe {
+                ((info.address + offset + i * 4) as *mut u32).write_volatile(cell.to_be());
+            }
+        }
+        Ok(())
+    }
+
     pub fn read_property_as_u8_array(&self, info: &DtbProperty) -> &[u8] {
         unsafe {
             core::slice::from_raw_parts(

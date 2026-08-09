@@ -407,15 +407,18 @@ pub fn create_vm(
     net_mac: [u8; 6],
 ) -> (usize, usize) {
     const RAM_VIRTUAL_BASE: usize = 0x40000000;
-    /// RAM SIZE: 256MiB
-    const RAM_SIZE: usize = 0x10000000;
+    /* RAM size: computed at boot from the host's usable RAM and the
+     * number of physical CPUs (see `setup_memory`/`get_guest_ram_size`),
+     * so both the QEMU and Raspberry Pi 4 builds give each guest an even
+     * share of whatever memory the machine actually has. */
+    let ram_size = crate::get_guest_ram_size();
     const ALIGN_SIZE: usize = 0x200000;
     /* Address of the GICv2 CPU Interface (GICC) shown to the guest
      * (must match reg[1] of the intc node in scripts/virt.dts) */
     const GUEST_GIC_CPU_INTERFACE_ADDRESS: usize = 0x8010000;
 
     /* Set up the basic elements of the virtual machine */
-    let ram_physical_address = crate::allocate_pages(RAM_SIZE >> PAGE_SHIFT, PAGE_SHIFT)
+    let ram_physical_address = crate::allocate_pages(ram_size >> PAGE_SHIFT, PAGE_SHIFT)
         .expect("Failed to allocate memory for VM.");
     let vm_id = NEXT_VM_ID.fetch_add(1, Ordering::Relaxed);
     let cpu_mpidr = asm::get_mpidr_el1();
@@ -428,7 +431,7 @@ pub fn create_vm(
      * bug observed after VM creation but before the guest's first MMIO
      * access to the device. */
     let (fat_buf_start, fat_buf_end) = fat32.debug_buffer_range();
-    let ram_end = ram_physical_address + RAM_SIZE;
+    let ram_end = ram_physical_address + ram_size;
     println!(
         "Guest RAM: [{:#X} ~ {:#X}], FAT32 root dir buffer: [{:#X} ~ {:#X}]{}",
         ram_physical_address,
@@ -459,7 +462,7 @@ pub fn create_vm(
         stage2_table_address,
         ram_physical_address,
         RAM_VIRTUAL_BASE,
-        RAM_SIZE,
+        ram_size,
         true,
         true,
     )
@@ -552,7 +555,7 @@ pub fn create_vm(
         vmid,
         RAM_VIRTUAL_BASE,
         ram_physical_address,
-        RAM_SIZE,
+        ram_size,
         mmio_handlers,
         gic_distributor_mmio,
         pl011_mmio,
@@ -575,6 +578,19 @@ pub fn create_vm(
     fat32
         .read(&kernel, blk, kernel_physical_address, 0, kernel_size)
         .expect("Failed to read Kernel");
+
+    /* Rewrite the guest DTB's memory node with the RAM size actually
+     * allocated to this VM: the DTB file on disk carries a fixed
+     * placeholder size (see scripts/virt.dts). Must happen before the
+     * cache maintenance below so the patched value is what the guest's
+     * instruction/data fetches observe. */
+    let guest_dtb = crate::dtb::Dtb::new(ram_physical_address).expect("Invalid guest DTB");
+    let guest_memory_node = guest_dtb
+        .search_node(b"memory", None)
+        .expect("No memory node in the guest DTB");
+    guest_dtb
+        .write_reg_size(&guest_memory_node, 0, ram_size)
+        .expect("Failed to patch the guest DTB memory size");
 
     /* Make the freshly loaded DTB and kernel image visible to the
      * instruction fetch path. Without this, a CPU with real (non-modeled)
